@@ -1,0 +1,3 @@
+/* Reserved for any page-level (non-shadow-DOM) styling needs.
+   Panel itself is styled inline within the Shadow DOM in content.js
+   so it can't be affected by the host page's CSS. */
