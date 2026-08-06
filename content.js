@@ -498,9 +498,71 @@
     await chrome.runtime.sendMessage(message);
   }
 
+  function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    const chunkSize = 0x8000; // avoid call-stack limits from String.fromCharCode on huge PDFs
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  async function startPdfSummary() {
+    activeCaptureMode = "pdf";
+    lastStructured = null;
+    lastRawStream = "";
+    getElement("copy-btn").disabled = true;
+    getElement("export-btn").disabled = true;
+
+    setBodyHTML(`
+      <div class="status">
+        <span class="spinner"></span>
+        Downloading PDF for text extraction...
+      </div>
+    `);
+
+    try {
+      // Same-origin fetch of the tab's own URL: this is the PDF the user is
+      // already looking at, so no extra host_permissions are needed beyond
+      // activeTab.
+      const response = await fetch(location.href);
+      if (!response.ok) {
+        throw new Error(`Could not download the PDF (status ${response.status}).`);
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      const pdfBase64 = arrayBufferToBase64(arrayBuffer);
+
+      setBodyHTML(`
+        <div class="status">
+          <span class="spinner"></span>
+          Extracting text from PDF...
+        </div>
+      `);
+
+      await sendRuntimeMessage({
+        type: "SUMMARIZE_PDF",
+        payload: {
+          pdfBase64,
+          title: document.title,
+          url: location.href
+        }
+      });
+    } catch (error) {
+      console.error(error);
+      showError(error.message || "Could not read this PDF. Try Summarize visual region instead.");
+    }
+  }
+
   async function startTextSummary(mode) {
     activeCaptureMode = mode;
     const domainHint = detectDomainHint();
+
+    if (mode === "page" && domainHint === "pdf") {
+      await startPdfSummary();
+      return;
+    }
+
     const payload = buildCapturePayload(mode);
 
     if (mode === "selection" && payload.pageText.length < 20) {
@@ -509,11 +571,7 @@
     }
 
     if (mode === "page" && payload.pageText.length < 20) {
-      if (domainHint === "pdf") {
-        showError("This looks like a PDF, but readable PDF text is not yet wired in. Use visual region capture for now.");
-      } else {
-        showError("Could not find readable page text. Try Summarize visual region for image-based content.");
-      }
+      showError("Could not find readable page text. Try Summarize visual region for image-based content.");
       return;
     }
 

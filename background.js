@@ -246,6 +246,8 @@ async function getModelSettings() {
   };
 }
 
+const REQUEST_TIMEOUT_MS = 60000; // covers the whole streamed response, not just headers
+
 async function streamOpenRouter(apiKey, model, messages, onChunk) {
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -259,7 +261,8 @@ async function streamOpenRouter(apiKey, model, messages, onChunk) {
       model,
       stream: true,
       messages
-    })
+    }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
   });
 
   if (!response.ok || !response.body) {
@@ -312,7 +315,8 @@ async function streamGemini(apiKey, model, parts, onChunk) {
     },
     body: JSON.stringify({
       contents: [{ role: "user", parts }]
-    })
+    }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
   });
 
   if (!response.ok || !response.body) {
@@ -353,6 +357,13 @@ async function streamGemini(apiKey, model, parts, onChunk) {
   return fullText;
 }
 
+function friendlyErrorMessage(error) {
+  if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+    return "The model did not respond within 60 seconds. This can happen with slow or rate-limited free-tier models. Try again, or switch models in the extension's Settings page.";
+  }
+  return error?.message || "The model request failed.";
+}
+
 async function summarizeTextOnce(tabId, text, title, url, domain) {
   const settings = await getModelSettings();
 
@@ -366,28 +377,110 @@ async function summarizeTextOnce(tabId, text, title, url, domain) {
   safeSendMessage(tabId, { type: "SUMMARY_START" });
 
   let raw = "";
+  const onChunk = (_, fullText) => {
+    raw = fullText;
+    // content.js already listens for SUMMARY_STREAM to render live tokens;
+    // this was previously never sent, so the panel only showed a spinner
+    // until the whole response landed.
+    safeSendMessage(tabId, { type: "SUMMARY_STREAM", fullText });
+  };
+
   if (settings.provider === "openrouter") {
-    raw = await streamOpenRouter(
-      settings.apiKey,
-      settings.model,
-      [{ role: "user", content: prompt }],
-      (_, fullText) => {
-        raw = fullText;
-      }
-    );
+    raw = await streamOpenRouter(settings.apiKey, settings.model, [{ role: "user", content: prompt }], onChunk);
   } else {
-    raw = await streamGemini(
-      settings.apiKey,
-      settings.model,
-      [{ text: prompt }],
-      (_, fullText) => {
-        raw = fullText;
-      }
-    );
+    raw = await streamGemini(settings.apiKey, settings.model, [{ text: prompt }], onChunk);
   }
 
   const parsed = normalizeSummary(parseJsonFromText(raw));
   safeSendMessage(tabId, { type: "SUMMARY_DONE", structured: parsed });
+}
+
+// --- PDF extraction via offscreen document ---
+// offscreen.js + pdf.min.mjs already implement real pdf.js-based text
+// extraction, but nothing was creating the offscreen document or calling
+// it. summarizePage() used to hard-fail on PDFs instead. Wired up below.
+
+let offscreenReadyPromise = null;
+
+async function ensureOffscreenDocument() {
+  if (chrome.offscreen && (await chrome.offscreen.hasDocument())) return;
+
+  if (offscreenReadyPromise) {
+    await offscreenReadyPromise;
+    return;
+  }
+
+  offscreenReadyPromise = chrome.offscreen.createDocument({
+    url: "offscreen.html",
+    reasons: ["BLOBS"],
+    justification: "Parse PDF bytes into text using pdf.js so PDF pages can be summarized."
+  });
+
+  await offscreenReadyPromise;
+  offscreenReadyPromise = null;
+}
+
+function extractPdfTextViaOffscreen(pdfBase64) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { target: "offscreen", type: "EXTRACT_PDF_TEXT", pdfBase64 },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        if (!response?.ok) {
+          reject(new Error(response?.error || "PDF text extraction failed."));
+          return;
+        }
+        resolve(response.text || "");
+      }
+    );
+  });
+}
+
+async function summarizePdf(tabId, payload) {
+  const title = payload.title || "";
+  const url = payload.url || "";
+
+  try {
+    await ensureOffscreenDocument();
+    const text = await extractPdfTextViaOffscreen(payload.pdfBase64);
+
+    if (!text || text.trim().length < 20) {
+      safeSendMessage(tabId, {
+        type: "SUMMARY_ERROR",
+        message: "Could not extract readable text from this PDF. Try Summarize visual region instead."
+      });
+      return;
+    }
+
+    // 20k chars was too small — a 15-page paper runs ~30k+ chars, and the
+    // old cap silently cut the model off mid-document (around page 7) with
+    // no way for it to know content was missing. Raised the cap, and now
+    // explicitly tell the model when truncation still happens so it
+    // discloses that honestly instead of reporting high confidence on a
+    // partial document.
+    const MAX_PDF_CHARS = 45000;
+    let usableText = text;
+    if (text.length > MAX_PDF_CHARS) {
+      usableText =
+        text.slice(0, MAX_PDF_CHARS) +
+        `\n\n[EXTRACTION NOTE: This PDF's extracted text was ${text.length} characters; ` +
+        `only the first ${MAX_PDF_CHARS} are included above due to length limits. ` +
+        `Content after this point (including anything from later sections, conclusion, ` +
+        `or references) was NOT provided to you. Do not claim confidence about ` +
+        `unseen content — list "content beyond the truncation point was not provided" ` +
+        `under unreadableSections.]`;
+    }
+
+    await summarizeTextOnce(tabId, usableText, title, url, "pdf");
+  } catch (error) {
+    safeSendMessage(tabId, {
+      type: "SUMMARY_ERROR",
+      message: friendlyErrorMessage(error)
+    });
+  }
 }
 
 async function summarizePage(tabId, payload, senderTabUrl) {
@@ -396,10 +489,13 @@ async function summarizePage(tabId, payload, senderTabUrl) {
   const url = payload.url || senderTabUrl || "";
   const domain = detectDomain(payload.domainHint || url);
 
+  // PDFs are now handled via the dedicated SUMMARIZE_PDF message (content.js
+  // fetches the raw bytes and routes there directly) before this function
+  // is ever called. This branch is a defensive fallback only.
   if (domain === "pdf" || isPdfLikePage(url)) {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
-      message: "This looks like a PDF, but PDF text extraction is not yet bundled. Use visual region capture for now."
+      message: "This looks like a PDF. Reopen the panel and choose Summarize page again."
     });
     return;
   }
@@ -417,7 +513,7 @@ async function summarizePage(tabId, payload, senderTabUrl) {
   } catch (error) {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
-      message: error.message || "The model request failed."
+      message: friendlyErrorMessage(error)
     });
   }
 }
@@ -457,6 +553,13 @@ async function summarizeImage(tabId, payload) {
   const prompt = buildImagePrompt(title, url);
   let raw = "";
 
+  safeSendMessage(tabId, { type: "SUMMARY_START" });
+
+  const onChunk = (_, fullText) => {
+    raw = fullText;
+    safeSendMessage(tabId, { type: "SUMMARY_STREAM", fullText });
+  };
+
   try {
     if (settings.provider === "openrouter") {
       raw = await streamOpenRouter(
@@ -469,9 +572,7 @@ async function summarizeImage(tabId, payload) {
             { type: "image_url", image_url: { url: imageDataUrl } }
           ]
         }],
-        (_, fullText) => {
-          raw = fullText;
-        }
+        onChunk
       );
     } else {
       const base64Data = imageDataUrl.split(",")[1];
@@ -482,9 +583,7 @@ async function summarizeImage(tabId, payload) {
           { text: prompt },
           { inline_data: { mime_type: mimeType, data: base64Data } }
         ],
-        (_, fullText) => {
-          raw = fullText;
-        }
+        onChunk
       );
     }
 
@@ -493,7 +592,7 @@ async function summarizeImage(tabId, payload) {
   } catch (error) {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
-      message: error.message || "The visual summary request failed."
+      message: friendlyErrorMessage(error)
     });
   }
 }
@@ -509,5 +608,9 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
   if (message.type === "SUMMARIZE_IMAGE" && sender.tab?.id) {
     summarizeImage(sender.tab.id, message.payload);
+  }
+
+  if (message.type === "SUMMARIZE_PDF" && sender.tab?.id) {
+    summarizePdf(sender.tab.id, message.payload);
   }
 });

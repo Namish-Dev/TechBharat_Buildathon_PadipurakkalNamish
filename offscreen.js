@@ -2,10 +2,14 @@ import * as pdfjsLib from "./pdf.min.mjs";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("pdf.worker.min.mjs");
 
-function toArrayBuffer(data) {
-  if (data instanceof ArrayBuffer) return data;
-  if (data?.buffer instanceof ArrayBuffer) return data.buffer;
-  return null;
+function base64ToArrayBuffer(base64) {
+  if (typeof base64 !== "string" || !base64) return null;
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
 }
 
 async function extractPdfText(arrayBuffer) {
@@ -42,9 +46,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "EXTRACT_PDF_TEXT") {
     (async () => {
       try {
-        const arrayBuffer = toArrayBuffer(message.arrayBuffer);
+        const arrayBuffer = base64ToArrayBuffer(message.pdfBase64);
 
-        if (!arrayBuffer) {
+        if (!arrayBuffer || arrayBuffer.byteLength === 0) {
           sendResponse({ ok: false, error: "Invalid PDF data." });
           return;
         }

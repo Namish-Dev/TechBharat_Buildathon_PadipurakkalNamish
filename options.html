@@ -1,118 +1,92 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Inline Summarizer — Settings</title>
+const providerSelect = document.getElementById("provider");
+const apiKeyInput = document.getElementById("api-key");
+const modelInput = document.getElementById("model");
+const saveButton = document.getElementById("save-btn");
+const status = document.getElementById("status");
 
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      max-width: 520px;
-      margin: 40px auto;
-      color: #222;
-      padding: 0 16px;
-    }
+const DEFAULT_MODELS = {
+  openrouter: "google/gemini-2.0-flash-001",
+  gemini: "gemini-2.5-flash"
+};
 
-    h2 {
-      margin-bottom: 4px;
-    }
+const PROVIDER_DETAILS = {
+  openrouter: {
+    keyPlaceholder: "sk-or-v1-...",
+    hint: "Paste your OpenRouter API key. You can use any OpenRouter-supported model ID."
+  },
+  gemini: {
+    keyPlaceholder: "AIza...",
+    hint: "Paste your Google Gemini API key from Google AI Studio."
+  }
+};
 
-    .hint {
-      color: #666;
-      font-size: 13px;
-      line-height: 1.5;
-      margin-top: 0;
-    }
+function updateProviderUI() {
+  const provider = providerSelect.value;
+  const details = PROVIDER_DETAILS[provider];
 
-    label {
-      display: block;
-      font-size: 13px;
-      font-weight: 600;
-      margin-top: 18px;
-      margin-bottom: 6px;
-    }
+  apiKeyInput.placeholder = details.keyPlaceholder;
 
-    input,
-    select {
-      width: 100%;
-      padding: 10px;
-      font-size: 14px;
-      border: 1px solid #ccc;
-      border-radius: 6px;
-      box-sizing: border-box;
-    }
+  const note = document.getElementById("provider-note");
 
-    button {
-      margin-top: 20px;
-      padding: 10px 16px;
-      font-size: 14px;
-      background: #6c5ce7;
-      color: white;
-      border: none;
-      border-radius: 6px;
-      cursor: pointer;
-    }
+  if (note) {
+    note.textContent = details.hint;
+  }
+}
 
-    button:hover {
-      background: #5a4bd1;
-    }
+async function loadSettings() {
+  const settings = await chrome.storage.local.get([
+    "apiProvider",
+    "apiKey",
+    "apiModel"
+  ]);
 
-    #status {
-      margin-top: 12px;
-      color: #16803c;
-      font-size: 13px;
-      display: none;
-    }
+  providerSelect.value = settings.apiProvider || "openrouter";
 
-    .provider-note {
-      margin-top: 8px;
-      color: #666;
-      font-size: 12px;
-      line-height: 1.45;
-    }
-  </style>
-</head>
+  apiKeyInput.value = settings.apiKey || "";
 
-<body>
-  <h2>Inline Summarizer Settings</h2>
+  modelInput.value =
+    settings.apiModel ||
+    DEFAULT_MODELS[providerSelect.value];
 
-  <p class="hint">
-    Choose your AI provider, paste your API key, and select or type a model name.
-    Keys are stored locally in this Chrome profile using <code>chrome.storage.local</code>.
-  </p>
+  updateProviderUI();
+}
 
-  <label for="provider">AI provider</label>
-  <select id="provider">
-    <option value="openrouter">OpenRouter</option>
-    <option value="gemini">Google Gemini</option>
-  </select>
+providerSelect.addEventListener("change", () => {
+  const provider = providerSelect.value;
 
-  <label for="api-key">API key</label>
-  <input
-    id="api-key"
-    type="password"
-    placeholder="Paste your API key"
-    autocomplete="off"
-  />
+  updateProviderUI();
 
-  <div class="provider-note" id="provider-note"></div>
+  modelInput.value = DEFAULT_MODELS[provider];
+});
 
-  <label for="model">Model</label>
-  <input
-    id="model"
-    type="text"
-    list="model-options"
-    placeholder="Choose or type a model name"
-    autocomplete="off"
-  />
+saveButton.addEventListener("click", async () => {
+  const apiProvider = providerSelect.value;
+  const apiKey = apiKeyInput.value.trim();
 
-  <datalist id="model-options">
-    <!-- Updated dynamically from options.js -->
-  </datalist>
+  const apiModel =
+    modelInput.value.trim() ||
+    DEFAULT_MODELS[apiProvider];
 
-  <button id="save-btn">Save settings</button>
-  <div id="status">Saved successfully.</div>
+  if (!apiKey) {
+    status.style.display = "block";
+    status.style.color = "#c92a2a";
+    status.textContent = "Please enter an API key.";
+    return;
+  }
 
-  <script src="options.js"></script>
-</body>
-</html>
+  await chrome.storage.local.set({
+    apiProvider,
+    apiKey,
+    apiModel
+  });
+
+  status.style.display = "block";
+  status.style.color = "#2b8a3e";
+  status.textContent = `Saved ${apiProvider} settings successfully.`;
+
+  setTimeout(() => {
+    status.style.display = "none";
+  }, 2500);
+});
+
+loadSettings();
