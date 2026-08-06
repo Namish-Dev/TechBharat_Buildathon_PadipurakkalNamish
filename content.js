@@ -1,13 +1,11 @@
 // content.js
-// Injected only after a deliberate toolbar-icon or keyboard-shortcut action.
-// Supports:
-// - Whole page text summarization
-// - Current text-selection summarization
-// - Visual region screenshot summarization
-// - Domain-aware mode hints
-// - PDF detection hints
-// - Structured streaming output
-// - Clipboard copy and Markdown export
+// Domain-aware capture for:
+// - Generic pages
+// - GitHub pull requests
+// - Gmail threads
+// - Jira pages/boards
+// - PDF-like pages (fallback)
+// - Selection and visual region capture
 
 (function () {
   if (window.__inlineSummarizerLoaded) {
@@ -19,7 +17,6 @@
 
   let hostEl = null;
   let shadow = null;
-
   let lastStructured = null;
   let lastRawStream = "";
   let activeCaptureMode = "page";
@@ -40,22 +37,10 @@
   function detectDomainHint() {
     const url = String(location.href || "").toLowerCase();
 
-    if (isPdfLikePage()) {
-      return "pdf";
-    }
-
-    if (url.includes("github.com") && url.includes("/pull/")) {
-      return "github_pr";
-    }
-
-    if (url.includes("mail.google.com")) {
-      return "gmail_thread";
-    }
-
-    if (url.includes("jira.") || url.includes("/browse/") || url.includes("/jira")) {
-      return "jira";
-    }
-
+    if (isPdfLikePage()) return "pdf";
+    if (url.includes("github.com") && url.includes("/pull/")) return "github_pr";
+    if (url.includes("mail.google.com")) return "gmail_thread";
+    if (url.includes("jira.") || url.includes("/browse/") || url.includes("/jira")) return "jira";
     return "generic";
   }
 
@@ -69,27 +54,6 @@
     return "Full page text";
   }
 
-  function getPageText() {
-    const contentRoot =
-      document.querySelector("article") ||
-      document.querySelector("main") ||
-      document.body;
-
-    return (contentRoot.innerText || "")
-      .replace(/\s+\n/g, "\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .replace(/[ \t]{2,}/g, " ")
-      .trim();
-  }
-
-  function getSelectionText() {
-    return (window.getSelection()?.toString() || "")
-      .replace(/\s+\n/g, "\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .replace(/[ \t]{2,}/g, " ")
-      .trim();
-  }
-
   function escapeHTML(value) {
     return String(value || "").replace(/[&<>"']/g, (character) => {
       const map = {
@@ -99,7 +63,6 @@
         '"': "&quot;",
         "'": "&#39;"
       };
-
       return map[character];
     });
   }
@@ -108,28 +71,213 @@
     return shadow?.getElementById(id);
   }
 
+  function cleanText(text) {
+    return String(text || "")
+      .replace(/\s+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/[ \t]{2,}/g, " ")
+      .trim();
+  }
+
+  function collectVisibleText(root, maxChars = 12000) {
+    const text = cleanText(root?.innerText || "");
+    if (!text) return "";
+    return text.slice(0, maxChars);
+  }
+
+  function getPageText() {
+    const preferredContent =
+      document.querySelector("article") ||
+      document.querySelector("main") ||
+      document.body;
+
+    return collectVisibleText(preferredContent, 12000);
+  }
+
+  function getSelectionText() {
+    return cleanText(window.getSelection()?.toString() || "").slice(0, 12000);
+  }
+
+  function getGitHubPrText() {
+    const pieces = [];
+
+    const titleEl =
+      document.querySelector("bdi.js-issue-title") ||
+      document.querySelector("span.js-issue-title") ||
+      document.querySelector("[data-testid='issue-title']") ||
+      document.querySelector("h1");
+
+    if (titleEl) pieces.push(`Title: ${cleanText(titleEl.textContent)}`);
+
+    const prMeta = document.querySelector("[data-hovercard-type='pull_request']") || document.querySelector("summary");
+    if (prMeta) {
+      const txt = cleanText(prMeta.textContent);
+      if (txt) pieces.push(txt);
+    }
+
+    const conversation =
+      document.querySelector("[data-tab-item='i0']") ||
+      document.querySelector("#discussion_bucket") ||
+      document.querySelector("[aria-label*='Conversation']");
+
+    if (conversation) {
+      const txt = collectVisibleText(conversation, 6000);
+      if (txt) pieces.push(`Conversation:\n${txt}`);
+    }
+
+    const filesChanged =
+      document.querySelector("[data-tab-item='files']") ||
+      document.querySelector("#files") ||
+      document.querySelector("[aria-label*='Files changed']");
+
+    if (filesChanged) {
+      const txt = collectVisibleText(filesChanged, 8000);
+      if (txt) pieces.push(`Files changed:\n${txt}`);
+    }
+
+    const comments = Array.from(
+      document.querySelectorAll(
+        "[data-testid='review-comment'], .js-comment-body, .comment-body, .timeline-comment"
+      )
+    )
+      .map((el) => cleanText(el.textContent))
+      .filter(Boolean)
+      .slice(0, 20);
+
+    if (comments.length) {
+      pieces.push(`Comments:\n${comments.join("\n\n")}`);
+    }
+
+    const fallback = getPageText();
+    if (!pieces.length && fallback) pieces.push(fallback);
+
+    return pieces.join("\n\n").slice(0, 16000);
+  }
+
+  function getGmailThreadText() {
+    const pieces = [];
+
+    const subject =
+      document.querySelector("h2.hP") ||
+      document.querySelector("[data-thread-subject]") ||
+      document.querySelector("h2");
+
+    if (subject) {
+      const txt = cleanText(subject.textContent);
+      if (txt) pieces.push(`Subject: ${txt}`);
+    }
+
+    const thread =
+      document.querySelector("[data-inboxsdk-currentthreadid]") ||
+      document.querySelector("[role='main']") ||
+      document.body;
+
+    const visibleText = collectVisibleText(thread, 16000);
+    if (visibleText) pieces.push(visibleText);
+
+    const threadIdEl = document.querySelector("[data-inboxsdk-currentthreadid]");
+    if (threadIdEl?.getAttribute("data-inboxsdk-currentthreadid")) {
+      pieces.push(`Thread ID: ${threadIdEl.getAttribute("data-inboxsdk-currentthreadid")}`);
+    }
+
+    return pieces.join("\n\n").slice(0, 16000);
+  }
+
+  function getJiraText() {
+    const pieces = [];
+
+    const titleEl =
+      document.querySelector("h1") ||
+      document.querySelector("[data-testid='issue.views.issue-base.foundation.summary.heading']");
+
+    if (titleEl) {
+      const txt = cleanText(titleEl.textContent);
+      if (txt) pieces.push(`Title: ${txt}`);
+    }
+
+    const statusEl =
+      document.querySelector("[data-testid='issue-field-status']") ||
+      document.querySelector("[aria-label*='Status']");
+
+    if (statusEl) {
+      const txt = cleanText(statusEl.textContent);
+      if (txt) pieces.push(`Status: ${txt}`);
+    }
+
+    const main =
+      document.querySelector("[role='main']") ||
+      document.querySelector("#jira-issue-header") ||
+      document.body;
+
+    const visibleText = collectVisibleText(main, 16000);
+    if (visibleText) pieces.push(visibleText);
+
+    return pieces.join("\n\n").slice(0, 16000);
+  }
+
+  function buildCapturePayload(mode) {
+    const domainHint = detectDomainHint();
+
+    let pageText = "";
+    if (mode === "selection") {
+      pageText = getSelectionText();
+    } else if (domainHint === "github_pr") {
+      pageText = getGitHubPrText();
+    } else if (domainHint === "gmail_thread") {
+      pageText = getGmailThreadText();
+    } else if (domainHint === "jira") {
+      pageText = getJiraText();
+    } else {
+      pageText = getPageText();
+    }
+
+    return {
+      pageText,
+      title: document.title,
+      url: location.href,
+      captureMode: mode === "page" ? domainHint : mode,
+      domainHint
+    };
+  }
+
+  function showPanel() {
+    if (!hostEl) buildPanel();
+    hostEl.style.display = "block";
+  }
+
+  function hidePanel() {
+    if (hostEl) hostEl.style.display = "none";
+  }
+
+  function togglePanel() {
+    if (!hostEl) {
+      showPanel();
+      return;
+    }
+    hostEl.style.display = hostEl.style.display === "none" ? "block" : "none";
+  }
+
+  window.__inlineSummarizerToggle = togglePanel;
+
+  function setBodyHTML(html) {
+    const body = getElement("body-area");
+    if (body) body.innerHTML = html;
+  }
+
   function buildPanel() {
     hostEl = document.createElement("div");
-
     hostEl.id = "__inline-summarizer-host";
     hostEl.style.position = "fixed";
     hostEl.style.top = "0";
     hostEl.style.right = "0";
     hostEl.style.zIndex = "2147483647";
-
     document.documentElement.appendChild(hostEl);
 
-    shadow = hostEl.attachShadow({
-      mode: "open"
-    });
+    shadow = hostEl.attachShadow({ mode: "open" });
 
     const style = document.createElement("style");
-
     style.textContent = `
-      :host {
-        all: initial;
-      }
-
+      :host { all: initial; }
       .panel {
         width: 420px;
         max-height: 90vh;
@@ -137,7 +285,6 @@
         display: flex;
         flex-direction: column;
         overflow: hidden;
-
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         color: #f4f4f7;
         background: #1d1d24;
@@ -145,7 +292,6 @@
         border-radius: 12px;
         box-shadow: 0 12px 34px rgba(0, 0, 0, 0.45);
       }
-
       .header {
         display: flex;
         align-items: center;
@@ -155,19 +301,8 @@
         background: #15151b;
         border-bottom: 1px solid #393944;
       }
-
-      .title-wrap {
-        display: flex;
-        flex-direction: column;
-        min-width: 0;
-      }
-
-      .title {
-        color: #ffffff;
-        font-size: 14px;
-        font-weight: 700;
-      }
-
+      .title-wrap { display: flex; flex-direction: column; min-width: 0; }
+      .title { color: #ffffff; font-size: 14px; font-weight: 700; }
       .subtitle {
         max-width: 340px;
         margin-top: 2px;
@@ -177,7 +312,6 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
-
       .close-btn {
         padding: 2px 7px;
         color: #a9a9b5;
@@ -188,12 +322,7 @@
         border-radius: 5px;
         cursor: pointer;
       }
-
-      .close-btn:hover {
-        color: #ffffff;
-        background: #30303a;
-      }
-
+      .close-btn:hover { color: #ffffff; background: #30303a; }
       .body {
         flex: 1;
         min-height: 170px;
@@ -202,7 +331,6 @@
         font-size: 13px;
         line-height: 1.55;
       }
-
       .meta {
         margin-bottom: 12px;
         padding: 8px 10px;
@@ -212,19 +340,13 @@
         border: 1px solid #2f2f39;
         border-radius: 8px;
       }
-
       .capture-actions {
         display: grid;
         grid-template-columns: 1fr 1fr;
         gap: 8px;
       }
-
-      .capture-actions .region-button {
-        grid-column: span 2;
-      }
-
-      .action-button,
-      .footer-button {
+      .capture-actions .region-button { grid-column: span 2; }
+      .action-button, .footer-button {
         padding: 9px 10px;
         color: #e8e8ee;
         font-size: 12px;
@@ -234,27 +356,14 @@
         border-radius: 7px;
         cursor: pointer;
       }
-
-      .action-button:hover,
-      .footer-button:hover {
-        background: #353540;
-      }
-
+      .action-button:hover, .footer-button:hover { background: #353540; }
       .action-button.primary {
         color: #ffffff;
         background: #6957dc;
         border-color: #7c6bef;
       }
-
-      .action-button.primary:hover {
-        background: #5c4bcb;
-      }
-
-      button:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-
+      .action-button.primary:hover { background: #5c4bcb; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
       .footer {
         display: flex;
         gap: 8px;
@@ -262,21 +371,9 @@
         background: #17171d;
         border-top: 1px solid #393944;
       }
-
-      .footer-button {
-        flex: 1;
-      }
-
-      .intro {
-        margin-bottom: 14px;
-        color: #c9c9d2;
-      }
-
-      .status {
-        color: #a8a8b4;
-        font-size: 12px;
-      }
-
+      .footer-button { flex: 1; }
+      .intro { margin-bottom: 14px; color: #c9c9d2; }
+      .status { color: #a8a8b4; font-size: 12px; }
       .section-title {
         margin-top: 14px;
         margin-bottom: 5px;
@@ -286,26 +383,10 @@
         letter-spacing: 0.06em;
         text-transform: uppercase;
       }
-
-      .summary-text {
-        color: #f2f2f5;
-      }
-
-      ul {
-        margin: 0;
-        padding-left: 19px;
-      }
-
-      li {
-        margin-bottom: 5px;
-      }
-
-      .empty {
-        color: #92929d;
-        font-size: 12px;
-        font-style: italic;
-      }
-
+      .summary-text { color: #f2f2f5; }
+      ul { margin: 0; padding-left: 19px; }
+      li { margin-bottom: 5px; }
+      .empty { color: #92929d; font-size: 12px; font-style: italic; }
       .error {
         padding: 10px;
         color: #ffb8b8;
@@ -315,7 +396,6 @@
         border: 1px solid #66313a;
         border-radius: 7px;
       }
-
       .spinner {
         display: inline-block;
         width: 12px;
@@ -327,7 +407,6 @@
         border-radius: 50%;
         animation: spin 0.8s linear infinite;
       }
-
       .raw-stream {
         max-height: 310px;
         margin-top: 10px;
@@ -342,44 +421,26 @@
         border: 1px solid #353540;
         border-radius: 6px;
       }
-
-      @keyframes spin {
-        to {
-          transform: rotate(360deg);
-        }
-      }
+      @keyframes spin { to { transform: rotate(360deg); } }
     `;
-
     shadow.appendChild(style);
 
     const panel = document.createElement("div");
     panel.className = "panel";
-
     panel.innerHTML = `
       <div class="header">
         <div class="title-wrap">
           <div class="title">Inline Summarizer</div>
           <div class="subtitle">${escapeHTML(document.title)}</div>
         </div>
-
-        <button class="close-btn" id="close-btn" title="Close">
-          ×
-        </button>
+        <button class="close-btn" id="close-btn" title="Close">×</button>
       </div>
-
       <div class="body" id="body-area"></div>
-
       <div class="footer">
-        <button class="footer-button" id="copy-btn" disabled>
-          Copy Markdown
-        </button>
-
-        <button class="footer-button" id="export-btn" disabled>
-          Export .md
-        </button>
+        <button class="footer-button" id="copy-btn" disabled>Copy Markdown</button>
+        <button class="footer-button" id="export-btn" disabled>Export .md</button>
       </div>
     `;
-
     shadow.appendChild(panel);
 
     getElement("close-btn").addEventListener("click", hidePanel);
@@ -389,40 +450,6 @@
     renderCaptureMenu();
   }
 
-  function showPanel() {
-    if (!hostEl) {
-      buildPanel();
-    }
-
-    hostEl.style.display = "block";
-  }
-
-  function hidePanel() {
-    if (hostEl) {
-      hostEl.style.display = "none";
-    }
-  }
-
-  function togglePanel() {
-    if (!hostEl) {
-      showPanel();
-      return;
-    }
-
-    hostEl.style.display =
-      hostEl.style.display === "none" ? "block" : "none";
-  }
-
-  window.__inlineSummarizerToggle = togglePanel;
-
-  function setBodyHTML(html) {
-    const body = getElement("body-area");
-
-    if (body) {
-      body.innerHTML = html;
-    }
-  }
-
   function renderCaptureMenu() {
     const domainHint = detectDomainHint();
 
@@ -430,151 +457,82 @@
       <div class="meta">
         Detected mode: <strong>${escapeHTML(getModeLabel(domainHint))}</strong>
       </div>
-
-      <div class="intro">
-        Choose what you want to summarize.
-      </div>
-
+      <div class="intro">Choose what you want to summarize.</div>
       <div class="capture-actions">
-        <button class="action-button primary" id="page-btn">
-          Summarize page
-        </button>
-
-        <button class="action-button" id="selection-btn">
-          Summarize selection
-        </button>
-
-        <button class="action-button region-button" id="region-btn">
-          Summarize visual region
-        </button>
+        <button class="action-button primary" id="page-btn">Summarize page</button>
+        <button class="action-button" id="selection-btn">Summarize selection</button>
+        <button class="action-button region-button" id="region-btn">Summarize visual region</button>
       </div>
     `);
 
-    getElement("page-btn").addEventListener("click", () => {
-      startTextSummary("page");
-    });
-
-    getElement("selection-btn").addEventListener("click", () => {
-      startTextSummary("selection");
-    });
-
-    getElement("region-btn").addEventListener("click", () => {
-      startRegionSelection();
-    });
+    getElement("page-btn").addEventListener("click", () => startTextSummary("page"));
+    getElement("selection-btn").addEventListener("click", () => startTextSummary("selection"));
+    getElement("region-btn").addEventListener("click", () => startRegionSelection());
   }
 
   function showError(message) {
     const copyButton = getElement("copy-btn");
     const exportButton = getElement("export-btn");
-
-    if (copyButton) {
-      copyButton.disabled = true;
-    }
-
-    if (exportButton) {
-      exportButton.disabled = true;
-    }
+    if (copyButton) copyButton.disabled = true;
+    if (exportButton) exportButton.disabled = true;
 
     setBodyHTML(`
-      <div class="error">
-        ${escapeHTML(message)}
-      </div>
-
+      <div class="error">${escapeHTML(message)}</div>
       <div class="section-title">Try again</div>
-
       <div class="capture-actions">
-        <button class="action-button primary" id="retry-page-btn">
-          Summarize page
-        </button>
-
-        <button class="action-button" id="retry-selection-btn">
-          Summarize selection
-        </button>
-
-        <button class="action-button region-button" id="retry-region-btn">
-          Summarize visual region
-        </button>
+        <button class="action-button primary" id="retry-page-btn">Summarize page</button>
+        <button class="action-button" id="retry-selection-btn">Summarize selection</button>
+        <button class="action-button region-button" id="retry-region-btn">Summarize visual region</button>
       </div>
     `);
 
-    getElement("retry-page-btn").addEventListener("click", () => {
-      startTextSummary("page");
-    });
-
-    getElement("retry-selection-btn").addEventListener("click", () => {
-      startTextSummary("selection");
-    });
-
-    getElement("retry-region-btn").addEventListener("click", () => {
-      startRegionSelection();
-    });
+    getElement("retry-page-btn").addEventListener("click", () => startTextSummary("page"));
+    getElement("retry-selection-btn").addEventListener("click", () => startTextSummary("selection"));
+    getElement("retry-region-btn").addEventListener("click", () => startRegionSelection());
   }
 
   async function sendRuntimeMessage(message) {
     if (!chrome.runtime?.id) {
-      throw new Error(
-        "Extension context was invalidated. Reload this webpage and reopen the extension."
-      );
+      throw new Error("Extension context was invalidated. Reload this webpage and reopen the extension.");
     }
-
     await chrome.runtime.sendMessage(message);
   }
 
   async function startTextSummary(mode) {
     activeCaptureMode = mode;
-
     const domainHint = detectDomainHint();
-    const pageText =
-      mode === "selection"
-        ? getSelectionText()
-        : getPageText();
+    const payload = buildCapturePayload(mode);
 
-    if (mode === "selection" && pageText.length < 20) {
-      showError(
-        "No usable text is selected. Highlight text on the page first, then choose Summarize selection."
-      );
+    if (mode === "selection" && payload.pageText.length < 20) {
+      showError("No usable text is selected. Highlight text on the page first, then choose Summarize selection.");
       return;
     }
 
-    if (mode === "page" && pageText.length < 20) {
+    if (mode === "page" && payload.pageText.length < 20) {
       if (domainHint === "pdf") {
-        showError(
-          "This looks like a PDF, but readable PDF text is not yet wired in. Use visual region capture for now."
-        );
+        showError("This looks like a PDF, but readable PDF text is not yet wired in. Use visual region capture for now.");
       } else {
-        showError(
-          "Could not find readable page text. Try Summarize visual region for image-based content."
-        );
+        showError("Could not find readable page text. Try Summarize visual region for image-based content.");
       }
       return;
     }
 
     lastStructured = null;
     lastRawStream = "";
-
     getElement("copy-btn").disabled = true;
     getElement("export-btn").disabled = true;
 
     setBodyHTML(`
       <div class="status">
         <span class="spinner"></span>
-        Reading ${getModeLabel(mode === "page" ? domainHint : mode)} and contacting model...
+        Reading ${escapeHTML(getModeLabel(mode === "page" ? domainHint : mode))} and contacting model...
       </div>
     `);
 
     try {
       await sendRuntimeMessage({
         type: "SUMMARIZE_PAGE",
-        payload: {
-          pageText,
-          title:
-            mode === "selection"
-              ? `Selection from ${document.title}`
-              : document.title,
-          url: location.href,
-          captureMode: mode === "page" ? domainHint : mode,
-          domainHint
-        }
+        payload
       });
     } catch (error) {
       console.error(error);
@@ -584,7 +542,6 @@
 
   function startRegionSelection() {
     activeCaptureMode = "region";
-
     hidePanel();
 
     const overlay = document.createElement("div");
@@ -610,16 +567,14 @@
     helper.style.transform = "translateX(-50%)";
     helper.style.padding = "10px 14px";
     helper.style.color = "#ffffff";
-    helper.style.fontFamily =
-      '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    helper.style.fontFamily = '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
     helper.style.fontSize = "13px";
     helper.style.background = "rgba(20, 20, 26, 0.95)";
     helper.style.border = "1px solid rgba(255, 255, 255, 0.16)";
     helper.style.borderRadius = "8px";
     helper.style.boxShadow = "0 6px 24px rgba(0, 0, 0, 0.4)";
     helper.style.pointerEvents = "none";
-    helper.textContent =
-      "Drag over an article, chart, table, or image. Press Escape to cancel.";
+    helper.textContent = "Drag over an article, chart, table, or image. Press Escape to cancel.";
 
     overlay.appendChild(selectionBox);
     overlay.appendChild(helper);
@@ -636,12 +591,9 @@
     }
 
     function getRect(currentX, currentY) {
-      const left = Math.min(startX, currentX);
-      const top = Math.min(startY, currentY);
-
       return {
-        left,
-        top,
+        left: Math.min(startX, currentX),
+        top: Math.min(startY, currentY),
         width: Math.abs(currentX - startX),
         height: Math.abs(currentY - startY)
       };
@@ -659,39 +611,24 @@
       selecting = true;
       startX = event.clientX;
       startY = event.clientY;
-
       overlay.setPointerCapture(event.pointerId);
-
-      drawSelection({
-        left: startX,
-        top: startY,
-        width: 0,
-        height: 0
-      });
+      drawSelection({ left: startX, top: startY, width: 0, height: 0 });
     });
 
     overlay.addEventListener("pointermove", (event) => {
-      if (!selecting) {
-        return;
-      }
-
+      if (!selecting) return;
       drawSelection(getRect(event.clientX, event.clientY));
     });
 
     overlay.addEventListener("pointerup", async (event) => {
-      if (!selecting) {
-        return;
-      }
-
+      if (!selecting) return;
       selecting = false;
 
       const rect = getRect(event.clientX, event.clientY);
 
       if (rect.width < 20 || rect.height < 20) {
         cancelSelection();
-        showError(
-          "The selected region is too small. Drag over a larger article, table, chart, or image."
-        );
+        showError("The selected region is too small. Drag over a larger article, table, chart, or image.");
         return;
       }
 
@@ -724,15 +661,9 @@
       }
     });
 
-    window.addEventListener(
-      "keydown",
-      (event) => {
-        if (event.key === "Escape") {
-          cancelSelection();
-        }
-      },
-      { once: true }
-    );
+    window.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") cancelSelection();
+    }, { once: true });
   }
 
   async function cropScreenshot(screenshotDataUrl, rect) {
@@ -782,10 +713,7 @@
         resolve(canvas.toDataURL("image/png"));
       };
 
-      image.onerror = () => {
-        reject(new Error("Could not read the captured screenshot."));
-      };
-
+      image.onerror = () => reject(new Error("Could not read the captured screenshot."));
       image.src = screenshotDataUrl;
     });
   }
@@ -799,10 +727,7 @@
         </div>
       `);
 
-      const imageDataUrl = await cropScreenshot(
-        message.screenshotDataUrl,
-        message.rect
-      );
+      const imageDataUrl = await cropScreenshot(message.screenshotDataUrl, message.rect);
 
       setBodyHTML(`
         <div class="status">
@@ -831,24 +756,15 @@
       return `<div class="empty">None detected</div>`;
     }
 
-    return `
-      <ul>
-        ${items
-          .map((item) => `<li>${escapeHTML(item)}</li>`)
-          .join("")}
-      </ul>
-    `;
+    return `<ul>${items.map((item) => `<li>${escapeHTML(item)}</li>`).join("")}</ul>`;
   }
 
   function renderStructuredSummary(summary) {
     lastStructured = summary;
-
     const sourceLabel = getModeLabel(activeCaptureMode);
 
     setBodyHTML(`
-      <div class="summary-text">
-        ${escapeHTML(summary.twoLineSummary || "No summary was returned.")}
-      </div>
+      <div class="summary-text">${escapeHTML(summary.twoLineSummary || "No summary was returned.")}</div>
 
       <div class="section-title">Key points</div>
       ${renderList(summary.keyPoints)}
@@ -863,12 +779,8 @@
       ${renderList(summary.numbers)}
 
       ${
-        Array.isArray(summary.unreadableSections) &&
-        summary.unreadableSections.length > 0
-          ? `
-            <div class="section-title">Unreadable sections</div>
-            ${renderList(summary.unreadableSections)}
-          `
+        Array.isArray(summary.unreadableSections) && summary.unreadableSections.length > 0
+          ? `<div class="section-title">Unreadable sections</div>${renderList(summary.unreadableSections)}`
           : ""
       }
 
@@ -879,52 +791,29 @@
 
       ${
         summary.confidenceReason
-          ? `
-            <div class="section-title">Confidence reason</div>
-            <div class="status">${escapeHTML(summary.confidenceReason)}</div>
-          `
+          ? `<div class="section-title">Confidence reason</div><div class="status">${escapeHTML(summary.confidenceReason)}</div>`
           : ""
       }
 
       <div class="section-title">Summarize something else</div>
-
       <div class="capture-actions">
-        <button class="action-button primary" id="again-page-btn">
-          Summarize page
-        </button>
-
-        <button class="action-button" id="again-selection-btn">
-          Summarize selection
-        </button>
-
-        <button class="action-button region-button" id="again-region-btn">
-          Summarize visual region
-        </button>
+        <button class="action-button primary" id="again-page-btn">Summarize page</button>
+        <button class="action-button" id="again-selection-btn">Summarize selection</button>
+        <button class="action-button region-button" id="again-region-btn">Summarize visual region</button>
       </div>
     `);
 
     getElement("copy-btn").disabled = false;
     getElement("export-btn").disabled = false;
 
-    getElement("again-page-btn").addEventListener("click", () => {
-      startTextSummary("page");
-    });
-
-    getElement("again-selection-btn").addEventListener("click", () => {
-      startTextSummary("selection");
-    });
-
-    getElement("again-region-btn").addEventListener("click", () => {
-      startRegionSelection();
-    });
+    getElement("again-page-btn").addEventListener("click", () => startTextSummary("page"));
+    getElement("again-selection-btn").addEventListener("click", () => startTextSummary("selection"));
+    getElement("again-region-btn").addEventListener("click", () => startRegionSelection());
   }
 
   function structuredToMarkdown(summary) {
     const listToMarkdown = (items) => {
-      if (!Array.isArray(items) || items.length === 0) {
-        return "_None detected_";
-      }
-
+      if (!Array.isArray(items) || items.length === 0) return "_None detected_";
       return items.map((item) => `- ${item}`).join("\n");
     };
 
@@ -959,20 +848,14 @@ ${summary.confidenceReason ? `Confidence reason: ${summary.confidenceReason}` : 
   }
 
   async function copySummary() {
-    if (!lastStructured) {
-      return;
-    }
+    if (!lastStructured) return;
 
     try {
-      await navigator.clipboard.writeText(
-        structuredToMarkdown(lastStructured)
-      );
+      await navigator.clipboard.writeText(structuredToMarkdown(lastStructured));
 
       const copyButton = getElement("copy-btn");
       const oldText = copyButton.textContent;
-
       copyButton.textContent = "Copied";
-
       setTimeout(() => {
         copyButton.textContent = oldText;
       }, 1200);
@@ -982,16 +865,11 @@ ${summary.confidenceReason ? `Confidence reason: ${summary.confidenceReason}` : 
   }
 
   function exportSummary() {
-    if (!lastStructured) {
-      return;
-    }
+    if (!lastStructured) return;
 
-    const blob = new Blob(
-      [structuredToMarkdown(lastStructured)],
-      {
-        type: "text/markdown"
-      }
-    );
+    const blob = new Blob([structuredToMarkdown(lastStructured)], {
+      type: "text/markdown"
+    });
 
     const objectUrl = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -1023,7 +901,6 @@ ${summary.confidenceReason ? `Confidence reason: ${summary.confidenceReason}` : 
           <span class="spinner"></span>
           ${escapeHTML(message.message || "Working...")}
         </div>
-
         <div class="raw-stream" id="raw-stream"></div>
       `);
       return;
@@ -1035,7 +912,6 @@ ${summary.confidenceReason ? `Confidence reason: ${summary.confidenceReason}` : 
           <span class="spinner"></span>
           Summarizing with your selected model...
         </div>
-
         <div class="raw-stream" id="raw-stream"></div>
       `);
       return;
@@ -1043,14 +919,11 @@ ${summary.confidenceReason ? `Confidence reason: ${summary.confidenceReason}` : 
 
     if (message.type === "SUMMARY_STREAM") {
       lastRawStream = message.fullText || "";
-
       const streamElement = getElement("raw-stream");
-
       if (streamElement) {
         streamElement.textContent = lastRawStream;
         streamElement.scrollTop = streamElement.scrollHeight;
       }
-
       return;
     }
 
@@ -1060,9 +933,7 @@ ${summary.confidenceReason ? `Confidence reason: ${summary.confidenceReason}` : 
     }
 
     if (message.type === "SUMMARY_ERROR") {
-      showError(
-        message.message || "An unknown summarization error occurred."
-      );
+      showError(message.message || "An unknown summarization error occurred.");
     }
   });
 
