@@ -307,15 +307,33 @@ async function streamGemini(apiKey, model, parts, onChunk) {
     "https://generativelanguage.googleapis.com/v1beta/models/" +
     `${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 
+  const requestBody = {
+    contents: [{ role: "user", parts }]
+  };
+
+  // Gemini 2.5 Flash supports disabling thinking via thinkingBudget = 0.
+  // We only attach the config for 2.5 models so older models are unaffected.
+  if (String(model || "").startsWith("gemini-2.5-")) {
+    requestBody.generationConfig = {
+      thinkingConfig: {
+        thinkingBudget: 0
+      }
+    };
+  } else if (String(model || "").startsWith("gemini-3")) {
+    requestBody.generationConfig = {
+      thinkingConfig: {
+        thinkingLevel: "low"
+      }
+    };
+  }
+
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-goog-api-key": apiKey
     },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts }]
-    }),
+    body: JSON.stringify(requestBody),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
   });
 
