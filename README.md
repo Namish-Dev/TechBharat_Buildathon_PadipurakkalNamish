@@ -1,114 +1,88 @@
 # Inline Summarizer
 
-Inline Summarizer is a Chrome Manifest V3 extension that summarizes a web page, a text selection, or a user-drawn screenshot region without leaving the current tab. It supports OpenRouter and Google Gemini, streams results into an in-page panel, and can copy or export the final summary as Markdown.
+Inline Summarizer is a Chromium Manifest V3 extension that captures and summarizes page content in-place. It supports text and visual-region summarization, domain-aware prompts (GitHub PRs, Gmail threads, Jira pages, PDFs), PDF extraction via an offscreen document, streaming model output, and follow-up Q&A against the last captured content.
 
-## What it does
+## Key features
 
-- Summarizes the visible page text.
-- Summarizes only the currently selected text.
-- Lets you drag-select a visual region for screenshot-based summarization.
-- Streams partial model output while the request is running.
-- Produces a structured summary with key points, action items, decisions, numbers, unreadable sections, and confidence.
-- Copies the summary to the clipboard or exports it as a `.md` file.
+- Capture modes: full page, selection, visual region (screenshot), and PDF extraction.
+- Domain-aware prompts for better summaries on GitHub PRs, Gmail threads, Jira, and PDFs.
+- Streaming display of partial model output while the model responds.
+- Structured JSON summaries with `twoLineSummary`, `keyPoints`, `actionItems`, `decisions`, `numbers`, `confidence`, `confidenceReason`, and `unreadableSections`.
+- Follow-up Q&A: ask questions about the last captured content without re-capturing.
+- Export summary as Markdown or copy to clipboard.
 
-## Project Structure
+## Project layout
 
-- [manifest.json](manifest.json) - Extension metadata, permissions, action button, keyboard shortcut, and options page registration.
-- [background.js](background.js) - Service worker that injects the content script, reads saved settings, calls OpenRouter or Gemini, chunks long text, and coordinates summarization.
-- [content.js](content.js) - In-page panel UI, text-selection handling, screenshot region selection, result rendering, copy/export actions, and streaming display.
-- [options.html](options.html) - Settings page UI for provider, API key, and model selection.
-- [options.js](options.js) - Loads and saves settings in `chrome.storage.local`.
-- [panel.css](panel.css) - Reserved for page-level styles outside the Shadow DOM panel.
-- [icons/](icons/) - Extension icons used by the toolbar action and manifest.
+- [manifest.json](manifest.json) - Extension metadata and permissions.
+- [background.js](background.js) - Service worker: model integration, streaming, PDF offscreen orchestration, follow-up context storage.
+- [content.js](content.js) - In-page UI panel, capture logic (page/selection/region/PDF), and follow-up chat UI.
+- [offscreen.html](offscreen.html) & [offscreen.js](offscreen.js) - Offscreen document for PDF text extraction using `pdfjs-dist`.
+- [options.html](options.html) & [options.js](options.js) - Settings page for provider, API key, and model.
+- [panel.css](panel.css) - Host-page stylesheet (the panel itself uses Shadow DOM styles).
+- [icons/](icons/) - Toolbar and extension icons.
+- [pdf.min.mjs](pdf.min.mjs), [pdf.worker.min.mjs](pdf.worker.min.mjs) - Bundled PDF runtime used by the offscreen document.
 
 ## Requirements
 
-- Google Chrome or another Chromium-based browser with Manifest V3 support.
-- An OpenRouter API key or a Google Gemini API key.
-- A model name supported by the provider you choose.
+- Chromium-based browser with Manifest V3 (Chrome, Edge, Brave, etc.).
+- An API key for either OpenRouter or Google Gemini (set in Options).
 
-## Installation
+Optional for development:
 
-1. Open your browser’s Extensions page.
+- Node/npm to install `pdfjs-dist` if you change the PDF extraction build: `npm install` will populate dependencies listed in `package.json`.
+
+## Installation (user)
+
+1. Open the browser Extensions page.
 2. Enable Developer mode.
-3. Choose Load unpacked and select this folder.
-4. Open the extension’s Options page and save your provider, API key, and model.
+3. Click "Load unpacked" and select this folder.
+4. Go to the extension Options page and add your API key and model, then save.
 
-## Usage
+## Quick usage
 
-### Open the panel
-
-- Click the extension icon in the toolbar, or
-- Press `Ctrl+Shift+Y` on Windows/Linux, or `Command+Shift+Y` on macOS.
-
-### Summarize a page
-
-1. Open a normal `http` or `https` page.
-2. Open the panel.
-3. Choose Summarize page.
-
-### Summarize selected text
-
-1. Highlight some text on the page.
-2. Open the panel.
-3. Choose Summarize selection.
-
-### Summarize a visual region
-
-1. Open the panel.
-2. Choose Summarize visual region.
-3. Drag over the article, chart, table, dashboard, or image you want summarized.
-4. Release to capture and summarize the cropped region.
+- Open the panel by clicking the extension icon or pressing `Ctrl+Shift+Y` (Windows/Linux) / `Command+Shift+Y` (macOS).
+- Choose `Summarize page`, `Summarize selection`, `Summarize visual region`, or `Summarize PDF` depending on the content type.
+- While the model runs, partial tokens appear in the panel; final structured JSON is rendered when complete.
+- Use the follow-up input to ask short questions about the last captured content (e.g., "what did it say about pricing?").
 
 ## Settings
 
-The options page stores settings locally in `chrome.storage.local`.
+- Provider: `openrouter` or `gemini`.
+- API key: stored locally in `chrome.storage.local`.
+- Model: enter the model ID supported by the provider.
 
-- Provider: OpenRouter or Google Gemini.
-- API key: Saved only in your local browser profile.
-- Model: Editable text field, so you can use any supported model name.
+## Permissions and privacy
 
-## Output Format
+- Requested permissions: `activeTab`, `scripting`, `storage`, `commands`, `clipboardWrite`, and `offscreen` (for PDF extraction).
+- Host permissions for the model endpoints are declared in the manifest.
+- API keys are stored locally in the browser profile; summarized page text or screenshots are sent to the provider you selected.
 
-The extension asks the model to return structured JSON with these fields:
+## Developer notes
 
-- `twoLineSummary`
-- `keyPoints`
-- `actionItems`
-- `decisions`
-- `numbers`
-- `confidence`
-- `confidenceReason`
-- `unreadableSections`
+- PDF extraction: `offscreen.js` runs inside an offscreen document and uses `pdfjs-dist`. The repo bundles `pdf.min.mjs` and `pdf.worker.min.mjs`, but if you rebuild or update, run:
 
-The panel renders those fields directly and also lets you copy or export them as Markdown.
+```powershell
+npm install
+```
 
-## Implementation Notes
+- Follow-up Q&A: the service worker saves the last captured summary to `chrome.storage.session` so the user can ask follow-ups without re-capturing. Stored context is cleaned when a tab closes.
+- Request timeout: streaming requests use a timeout to avoid hanging on very slow models.
 
-- `background.js` streams responses from OpenRouter or Gemini and normalizes the final JSON.
-- Long pages are split into chunks, summarized individually, then combined into a final summary.
-- Screenshot-region summaries are treated more cautiously and capped to lower confidence because the source can be cropped or blurry.
-- The content script uses a Shadow DOM panel so page CSS does not restyle the UI.
-- The extension only injects on regular `http` and `https` pages.
+## Troubleshooting
 
-## Permissions
+- If the panel reports "No API key found", open Options and paste your provider key, then save.
+- If PDF extraction fails, try opening the PDF directly in the tab (same origin) or use visual-region capture.
+- If the model returns invalid JSON, the panel shows the raw text and an error — try switching models in Options.
 
-The manifest requests these permissions:
+## Where to look in the code
 
-- `activeTab` and `scripting` for injecting the panel and capture logic.
-- `storage` for saving provider settings and API keys.
-- `commands` for the keyboard shortcut.
-- `clipboardWrite` for copying summaries.
-- Host permissions for OpenRouter and Google Gemini API endpoints.
+- Capture & UI: [content.js](content.js)
+- Model integration, streaming, follow-up logic, PDF orchestration: [background.js](background.js)
+- PDF extraction worker: [offscreen.js](offscreen.js)
+- Settings UI: [options.html](options.html) and [options.js](options.js)
 
-## Privacy
+## **Notes**
 
-- API keys stay in your local browser profile.
-- The page text or screenshot you summarize is sent to the provider you selected.
-- No local backend is included in this project.
-
-## Notes
-
-- The extension works best on pages with readable article text.
-- If a page has little or no selectable text, use Summarize visual region instead.
-- If the model returns invalid JSON, the panel will show an error and let you try again.
+- We recommend Gemini models for summarization because they typically provide lower latency in this application.
+- The **Summarize Visual Region** feature requires a Vision Language Model (VLM).
+- Translation and document structuring quality depend on the selected LLM. In general, more capable models produce higher-quality results.
