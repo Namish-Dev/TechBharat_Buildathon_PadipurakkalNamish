@@ -5,7 +5,7 @@ const saveButton = document.getElementById("save-btn");
 const status = document.getElementById("status");
 
 const DEFAULT_MODELS = {
-  openrouter: "google/gemini-2.0-flash-001",
+  openrouter: "google/gemma-4-26b-a4b-it:free",
   gemini: "gemini-2.5-flash"
 };
 
