@@ -20,6 +20,7 @@
   let lastStructured = null;
   let lastRawStream = "";
   let activeCaptureMode = "page";
+  let followupMessages = []; // [{ role: "user"|"assistant", content, pending? }]
 
   function isPdfLikePage() {
     const url = String(location.href || "").toLowerCase();
@@ -421,6 +422,50 @@
         border: 1px solid #353540;
         border-radius: 6px;
       }
+      .followup-chat {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        max-height: 220px;
+        margin-bottom: 8px;
+        overflow-y: auto;
+      }
+      .chat-bubble {
+        max-width: 92%;
+        padding: 7px 10px;
+        font-size: 12px;
+        line-height: 1.5;
+        border-radius: 8px;
+        white-space: pre-wrap;
+      }
+      .chat-bubble.user {
+        align-self: flex-end;
+        color: #f4f4f7;
+        background: #3d3670;
+        border: 1px solid #4d44a0;
+      }
+      .chat-bubble.assistant {
+        align-self: flex-start;
+        color: #e8e8ee;
+        background: #24242e;
+        border: 1px solid #34343f;
+      }
+      .followup-input-row {
+        display: flex;
+        gap: 6px;
+      }
+      .followup-input-row input {
+        flex: 1;
+        padding: 8px 9px;
+        color: #f4f4f7;
+        font-size: 12px;
+        background: #17171d;
+        border: 1px solid #393944;
+        border-radius: 7px;
+      }
+      .followup-input-row input:focus { outline: 1px solid #7c6bef; }
+      .followup-input-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .followup-empty { color: #92929d; font-size: 11px; font-style: italic; margin-bottom: 8px; }
       @keyframes spin { to { transform: rotate(360deg); } }
     `;
     shadow.appendChild(style);
@@ -819,6 +864,7 @@
 
   function renderStructuredSummary(summary) {
     lastStructured = summary;
+    followupMessages = []; // fresh capture -> fresh conversation
     const sourceLabel = getModeLabel(activeCaptureMode);
 
     setBodyHTML(`
@@ -853,6 +899,13 @@
           : ""
       }
 
+      <div class="section-title">Ask a follow-up</div>
+      <div class="followup-chat" id="followup-chat"></div>
+      <div class="followup-input-row">
+        <input type="text" id="followup-input" placeholder="e.g. what did it say about pricing?" />
+        <button class="action-button primary" id="followup-ask-btn">Ask</button>
+      </div>
+
       <div class="section-title">Summarize something else</div>
       <div class="capture-actions">
         <button class="action-button primary" id="again-page-btn">Summarize page</button>
@@ -867,7 +920,63 @@
     getElement("again-page-btn").addEventListener("click", () => startTextSummary("page"));
     getElement("again-selection-btn").addEventListener("click", () => startTextSummary("selection"));
     getElement("again-region-btn").addEventListener("click", () => startRegionSelection());
+
+    renderFollowupChat();
+    getElement("followup-ask-btn").addEventListener("click", submitFollowupQuestion);
+    getElement("followup-input").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") submitFollowupQuestion();
+    });
   }
+
+  function renderFollowupChat() {
+    const chatEl = getElement("followup-chat");
+    if (!chatEl) return;
+
+    if (followupMessages.length === 0) {
+      chatEl.innerHTML = `<div class="followup-empty">No questions asked yet.</div>`;
+      return;
+    }
+
+    chatEl.innerHTML = followupMessages
+      .map((message) => {
+        const cls = message.role === "user" ? "user" : "assistant";
+        const text = message.pending && !message.content ? "…" : message.content;
+        return `<div class="chat-bubble ${cls}">${escapeHTML(text)}</div>`;
+      })
+      .join("");
+
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  async function submitFollowupQuestion() {
+    const input = getElement("followup-input");
+    const askButton = getElement("followup-ask-btn");
+    if (!input) return;
+
+    const question = input.value.trim();
+    if (!question) return;
+
+    input.value = "";
+    input.disabled = true;
+    if (askButton) askButton.disabled = true;
+
+    followupMessages.push({ role: "user", content: question });
+    followupMessages.push({ role: "assistant", content: "", pending: true });
+    renderFollowupChat();
+
+    try {
+      await sendRuntimeMessage({ type: "ASK_FOLLOWUP", payload: { question } });
+    } catch (error) {
+      followupMessages[followupMessages.length - 1] = {
+        role: "assistant",
+        content: `Error: ${error.message || "The question could not be sent."}`
+      };
+      renderFollowupChat();
+      input.disabled = false;
+      if (askButton) askButton.disabled = false;
+    }
+  }
+
 
   function structuredToMarkdown(summary) {
     const listToMarkdown = (items) => {
@@ -992,6 +1101,49 @@ ${summary.confidenceReason ? `Confidence reason: ${summary.confidenceReason}` : 
 
     if (message.type === "SUMMARY_ERROR") {
       showError(message.message || "An unknown summarization error occurred.");
+      return;
+    }
+
+    if (message.type === "FOLLOWUP_START") {
+      // Pending bubble already shows "…" from submitFollowupQuestion(); nothing else to do yet.
+      return;
+    }
+
+    if (message.type === "FOLLOWUP_STREAM") {
+      const last = followupMessages[followupMessages.length - 1];
+      if (last && last.pending) {
+        last.content = message.fullText || "";
+        renderFollowupChat();
+      }
+      return;
+    }
+
+    if (message.type === "FOLLOWUP_DONE") {
+      const last = followupMessages[followupMessages.length - 1];
+      if (last && last.pending) {
+        followupMessages[followupMessages.length - 1] = { role: "assistant", content: message.answer || "" };
+      }
+      renderFollowupChat();
+      const input = getElement("followup-input");
+      const askButton = getElement("followup-ask-btn");
+      if (input) input.disabled = false;
+      if (askButton) askButton.disabled = false;
+      return;
+    }
+
+    if (message.type === "FOLLOWUP_ERROR") {
+      const last = followupMessages[followupMessages.length - 1];
+      if (last && last.pending) {
+        followupMessages[followupMessages.length - 1] = {
+          role: "assistant",
+          content: `⚠ ${message.message || "Something went wrong."}`
+        };
+      }
+      renderFollowupChat();
+      const input = getElement("followup-input");
+      const askButton = getElement("followup-ask-btn");
+      if (input) input.disabled = false;
+      if (askButton) askButton.disabled = false;
     }
   });
 

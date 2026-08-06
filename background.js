@@ -393,7 +393,146 @@ async function summarizeTextOnce(tabId, text, title, url, domain) {
 
   const parsed = normalizeSummary(parseJsonFromText(raw));
   safeSendMessage(tabId, { type: "SUMMARY_DONE", structured: parsed });
+
+  // Store what was captured so the user can ask follow-up questions without
+  // re-capturing. Uses chrome.storage.session (not a plain in-memory Map)
+  // because MV3 service workers can be killed and restarted between user
+  // actions, which would silently wipe an in-memory store.
+  await saveFollowupContext(tabId, { title, url, domain, sourceText: text, structuredSummary: parsed });
 }
+
+// --- Follow-up Q&A against already-captured content ---
+// Lets the user ask things like "what did it say about pricing" against the
+// last captured page/selection/PDF without triggering a new capture.
+
+function followupContextKey(tabId) {
+  return `context:${tabId}`;
+}
+
+async function saveFollowupContext(tabId, data) {
+  try {
+    await chrome.storage.session.set({
+      [followupContextKey(tabId)]: { ...data, history: [] }
+    });
+  } catch (error) {
+    console.warn("Inline Summarizer: could not save follow-up context.", error);
+  }
+}
+
+async function getFollowupContext(tabId) {
+  try {
+    const key = followupContextKey(tabId);
+    const result = await chrome.storage.session.get(key);
+    return result[key] || null;
+  } catch {
+    return null;
+  }
+}
+
+function formatStructuredForPrompt(summary) {
+  if (!summary) return "";
+  const listify = (items) =>
+    Array.isArray(items) && items.length ? items.map((item) => `- ${item}`).join("\n") : "None detected";
+
+  return `Two-line summary: ${summary.twoLineSummary || ""}
+Key points:
+${listify(summary.keyPoints)}
+Action items:
+${listify(summary.actionItems)}
+Decisions:
+${listify(summary.decisions)}
+Numbers:
+${listify(summary.numbers)}`;
+}
+
+function buildFollowupPrompt(context, question) {
+  const historyText = (context.history || [])
+    .map((turn) => `${turn.role === "user" ? "User" : "Assistant"}: ${turn.content}`)
+    .join("\n\n");
+
+  return `You previously captured and summarized content for the user. Answer their follow-up question using ONLY the captured content below. If the answer is not present in it, say so plainly instead of guessing — do not invent details.
+
+Captured content title: ${context.title}
+Captured content URL: ${context.url}
+
+CAPTURED CONTENT:
+"""
+${context.sourceText}
+"""
+
+YOUR PREVIOUS SUMMARY:
+${formatStructuredForPrompt(context.structuredSummary)}
+
+${historyText ? `CONVERSATION SO FAR:\n${historyText}\n` : ""}
+New question: ${question}
+
+Answer conversationally in plain text (not JSON), concisely, citing specific details from the captured content where relevant.`;
+}
+
+async function askFollowup(tabId, payload) {
+  const question = String(payload?.question || "").trim();
+  if (!question) {
+    safeSendMessage(tabId, { type: "FOLLOWUP_ERROR", message: "Type a question first." });
+    return;
+  }
+
+  const context = await getFollowupContext(tabId);
+  if (!context || !context.sourceText) {
+    safeSendMessage(tabId, {
+      type: "FOLLOWUP_ERROR",
+      message: "No captured content to ask about yet. Summarize the page, selection, or a region first."
+    });
+    return;
+  }
+
+  let settings;
+  try {
+    settings = await getModelSettings();
+  } catch (error) {
+    safeSendMessage(tabId, { type: "FOLLOWUP_ERROR", message: error.message });
+    return;
+  }
+
+  safeSendMessage(tabId, { type: "FOLLOWUP_START" });
+
+  const prompt = buildFollowupPrompt(context, question);
+  let raw = "";
+  const onChunk = (_, fullText) => {
+    raw = fullText;
+    safeSendMessage(tabId, { type: "FOLLOWUP_STREAM", fullText });
+  };
+
+  try {
+    if (settings.provider === "openrouter") {
+      raw = await streamOpenRouter(settings.apiKey, settings.model, [{ role: "user", content: prompt }], onChunk);
+    } else {
+      raw = await streamGemini(settings.apiKey, settings.model, [{ text: prompt }], onChunk);
+    }
+  } catch (error) {
+    safeSendMessage(tabId, { type: "FOLLOWUP_ERROR", message: friendlyErrorMessage(error) });
+    return;
+  }
+
+  const answer = raw.trim() || "The model did not return an answer.";
+
+  const history = Array.isArray(context.history) ? context.history : [];
+  history.push({ role: "user", content: question });
+  history.push({ role: "assistant", content: answer });
+
+  try {
+    await chrome.storage.session.set({
+      [followupContextKey(tabId)]: { ...context, history: history.slice(-12) } // cap to last 6 exchanges
+    });
+  } catch {}
+
+  safeSendMessage(tabId, { type: "FOLLOWUP_DONE", answer });
+}
+
+// Drop stored context once a tab closes, so chrome.storage.session doesn't
+// accumulate stale entries indefinitely.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  chrome.storage.session.remove(followupContextKey(tabId)).catch(() => {});
+});
 
 // --- PDF extraction via offscreen document ---
 // offscreen.js + pdf.min.mjs already implement real pdf.js-based text
@@ -588,7 +727,17 @@ async function summarizeImage(tabId, payload) {
     }
 
     const parsed = normalizeSummary(parseJsonFromText(raw));
-    safeSendMessage(tabId, { type: "SUMMARY_DONE", structured: capVisual(parsed) });
+    const capped = capVisual(parsed);
+    safeSendMessage(tabId, { type: "SUMMARY_DONE", structured: capped });
+
+    await saveFollowupContext(tabId, {
+      title,
+      url,
+      domain: "visual_region",
+      sourceText:
+        "[This capture was a screenshot region, not extracted text. Follow-up answers can only draw on the structured summary below, not on the original image.]",
+      structuredSummary: capped
+    });
   } catch (error) {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
@@ -612,5 +761,9 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
   if (message.type === "SUMMARIZE_PDF" && sender.tab?.id) {
     summarizePdf(sender.tab.id, message.payload);
+  }
+
+  if (message.type === "ASK_FOLLOWUP" && sender.tab?.id) {
+    askFollowup(sender.tab.id, message.payload);
   }
 });
