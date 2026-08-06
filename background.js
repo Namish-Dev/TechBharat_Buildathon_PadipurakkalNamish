@@ -1,41 +1,32 @@
-// background.js — Manifest V3 service worker
-// Supports:
-// - OpenRouter text + vision models
-// - Gemini text + vision models
-// - Whole page summarization
-// - Selected text summarization
-// - Drawn visual-region screenshot summarization
-// - Chunked map-reduce summarization for long text pages
+// background.js — fast, simplified MV3 service worker
+// - Single-pass text summarization for normal pages
+// - Domain-aware prompts
+// - Visual region summarization kept
+// - PDF fallback kept honest
+// - No chunking pipeline
 
 const DEFAULT_MODELS = {
-  openrouter: "google/gemma-4-26b-a4b-it:free",
+  openrouter: "google/gemma-4-a4b-it:free",
   gemini: "gemini-3.5-flash"
 };
 
 function safeSendMessage(tabId, message) {
   chrome.tabs.sendMessage(tabId, message, () => {
     if (chrome.runtime.lastError) {
-      console.warn(
-        "Inline Summarizer message was not delivered:",
-        chrome.runtime.lastError.message
-      );
+      console.warn("Inline Summarizer message was not delivered:", chrome.runtime.lastError.message);
     }
   });
 }
 
 async function injectAndToggle(tab) {
-  if (!tab?.id || !tab.url || !/^https?:\/\//.test(tab.url)) {
-    return;
-  }
+  if (!tab?.id || !tab.url || !/^https?:\/\//.test(tab.url)) return;
 
   try {
     await chrome.scripting.insertCSS({
       target: { tabId: tab.id },
       files: ["panel.css"]
     });
-  } catch {
-    // CSS may already be inserted.
-  }
+  } catch {}
 
   try {
     await chrome.scripting.executeScript({
@@ -52,52 +43,38 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.commands.onCommand.addListener((command, tab) => {
-  if (command === "toggle-summarizer") {
-    injectAndToggle(tab);
-  }
+  if (command === "toggle-summarizer") injectAndToggle(tab);
 });
 
-function getCommonJsonSchema() {
+function getSchema() {
   return `Return ONLY valid JSON.
 
-Do not use markdown fences.
-Do not write any explanation before or after the JSON.
-
-Use exactly this JSON shape:
+Use exactly this shape:
 {
-  "twoLineSummary": "string, maximum two sentences",
+  "twoLineSummary": "string",
   "keyPoints": ["string"],
   "actionItems": ["string"],
   "decisions": ["string"],
   "numbers": ["string"],
-  "confidence": "high",
+  "confidence": "high" | "medium" | "low",
   "confidenceReason": "string",
   "unreadableSections": ["string"]
 }
 
 Rules:
-- Be faithful to the supplied source.
-- Never invent facts, names, dates, numbers, decisions, or action items.
-- Keep keyPoints to at most 6 short items.
-- Use empty arrays when a category has no relevant content.
-- confidence must be exactly "high", "medium", or "low".
-- confidenceReason must explain why that confidence level was chosen.
-- Every item in numbers must preserve context, for example "Revenue: ₹5 crore", never just "5 crore".
-- If source content is incomplete, unreadable, vague, cropped, or ambiguous, state that in unreadableSections.`;
+- Be faithful.
+- Do not invent.
+- Keep it concise.
+- If content is partial or unclear, say so in unreadableSections.`;
 }
 
-function buildTextPrompt(text, title, url) {
+function buildGenericPrompt(text, title, url) {
   return `You are summarizing a web page for a knowledge worker.
 
 Page title: ${title}
 Page URL: ${url}
 
-${getCommonJsonSchema()}
-
-Text-specific rules:
-- Extract concrete names and numbers only when explicitly present in the text.
-- Do not infer missing context.
-- Keep the two-line summary focused on the actual subject, not the webpage layout.
+${getSchema()}
 
 PAGE CONTENT:
 """
@@ -105,76 +82,168 @@ ${text}
 """`;
 }
 
-function buildChunkPrompt(chunkText, chunkIndex, chunkCount, title, url) {
-  return `You are summarizing part ${chunkIndex} of ${chunkCount} from a web page.
+function buildGitHubPrPrompt(text, title, url) {
+  return `You are summarizing a GitHub pull request for a reviewer.
 
-Page title: ${title}
-Page URL: ${url}
+PR title: ${title}
+PR URL: ${url}
 
-${getCommonJsonSchema()}
+${getSchema()}
 
-Chunk rules:
-- Summarize only what is present in this chunk.
-- Preserve exact numbers, names, and key claims from this chunk.
-- Keep the output concise and information-dense.
-- If the chunk is mostly navigation or repeated boilerplate, say so in unreadableSections.
+GitHub PR rules:
+- Summarize what changed, risk, review concerns, tests, and likely impact.
+- Prefer code-review language.
+- Do not invent code details.
 
-CHUNK ${chunkIndex} OF ${chunkCount}:
+PR CONTENT:
 """
-${chunkText}
+${text}
 """`;
 }
 
-function buildReducePrompt(chunkSummaries, title, url) {
-  return `You are combining chunk-level summaries into one final structured summary.
+function buildGmailPrompt(text, title, url) {
+  return `You are summarizing a Gmail thread.
+
+Thread title: ${title}
+Thread URL: ${url}
+
+${getSchema()}
+
+Gmail rules:
+- Summarize the purpose, status, action items, deadlines, and required response.
+- Do not invent names or commitments.
+
+EMAIL THREAD:
+"""
+${text}
+"""`;
+}
+
+function buildJiraPrompt(text, title, url) {
+  return `You are summarizing a Jira page or board.
 
 Page title: ${title}
 Page URL: ${url}
 
-${getCommonJsonSchema()}
+${getSchema()}
 
-Important combine rules:
-- Use only the chunk summaries below.
-- Merge duplicate points.
-- Preserve exact numbers and named entities when they appear consistently across chunks.
-- Prefer the most specific faithful wording supported by the chunk summaries.
-- Do not invent facts that are not present in the chunk summaries.
-- Keep the final summary concise and well-structured.
+Jira rules:
+- Summarize work items, status, blockers, owners, and next steps.
+- If it is a board, summarize the overall state.
+- Do not invent ticket numbers or statuses.
 
-CHUNK SUMMARIES:
+JIRA CONTENT:
 """
-${chunkSummaries}
+${text}
+"""`;
+}
+
+function buildPdfPrompt(text, title, url) {
+  return `You are summarizing a PDF document.
+
+Document title: ${title}
+Document URL: ${url}
+
+${getSchema()}
+
+PDF rules:
+- Summarize section structure, main ideas, and conclusions.
+- If the extracted text is partial, state that.
+- Do not hallucinate figures, equations, or tables.
+
+PDF TEXT:
+"""
+${text}
 """`;
 }
 
 function buildImagePrompt(title, url) {
-  return `You are analyzing a user-selected screenshot region from a webpage.
+  return `You are analyzing a screenshot region from a webpage.
 
 Page title: ${title}
 Page URL: ${url}
 
-The screenshot may contain Telugu, English, other Indian languages, news thumbnails, charts, tables, dashboards, scanned text, or article content.
+${getSchema()}
 
-${getCommonJsonSchema()}
+Visual rules:
+- Only report what is directly visible.
+- Do not guess cropped or blurry names or numbers.
+- Prefer broader topics when visibility is limited.
 
-Visual-summary rules:
-- Only report information directly visible.
-- Do not reconstruct cropped or partially hidden headlines.
-- If a headline cannot be read completely, summarize its topic rather than inferring missing details.
-- Prefer broader categories over specific names or numbers when visibility is limited.
-- If a monetary value, person's name, or statistic is not fully legible, omit it rather than guessing.
-- Never invent English transliterations of Telugu names.
-- Never guess missing Telugu words.
-- Do not begin with "This screenshot shows" or "This page contains".
-- Do not describe the grid/layout unless that is directly relevant.
-- Keep keyPoints to at most 6 short items.
-- Every number must include clear context. Do not return a number by itself.
-- Screenshot confidence should normally be medium or low.
+SCREENSHOT REGION`;
+}
 
-Before returning the summary, self-check:
-For every named person, number, location, organization, monetary value, event, statistic, and specific claim:
-Can this be clearly read from the screenshot?
-If no: remove it or replace it with a broader topic-level description.`;
+function detectDomain(url) {
+  const lower = String(url || "").toLowerCase();
+  if (lower.endsWith(".pdf") || lower.includes(".pdf?")) return "pdf";
+  if (lower.includes("github.com") && lower.includes("/pull/")) return "github_pr";
+  if (lower.includes("mail.google.com")) return "gmail_thread";
+  if (lower.includes("jira.") || lower.includes("/browse/") || lower.includes("/jira")) return "jira";
+  return "generic";
+}
+
+function isPdfLikePage(url) {
+  return /\.pdf($|\?)/i.test(String(url || ""));
+}
+
+function normalizeSummary(summary) {
+  const allowed = ["high", "medium", "low"];
+  return {
+    twoLineSummary: typeof summary.twoLineSummary === "string" ? summary.twoLineSummary.trim() : "",
+    keyPoints: Array.isArray(summary.keyPoints) ? summary.keyPoints : [],
+    actionItems: Array.isArray(summary.actionItems) ? summary.actionItems : [],
+    decisions: Array.isArray(summary.decisions) ? summary.decisions : [],
+    numbers: Array.isArray(summary.numbers) ? summary.numbers : [],
+    confidence: allowed.includes(summary.confidence) ? summary.confidence : "medium",
+    confidenceReason: typeof summary.confidenceReason === "string" ? summary.confidenceReason.trim() : "",
+    unreadableSections: Array.isArray(summary.unreadableSections) ? summary.unreadableSections : []
+  };
+}
+
+function capVisual(summary) {
+  const s = normalizeSummary(summary);
+  if (s.confidence === "high") s.confidence = "medium";
+  if (!s.unreadableSections.some((x) => String(x).toLowerCase().includes("visual"))) {
+    s.unreadableSections.unshift("Visual-source limitation: screenshot text or labels may be cropped, small, or partially unreadable.");
+  }
+  if (!s.confidenceReason) {
+    s.confidenceReason = "Confidence capped because the source is a screenshot region.";
+  }
+  return s;
+}
+
+function parseJsonFromText(text) {
+  const cleaned = String(text || "").replace(/```json/gi, "").replace(/```/g, "").trim();
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error("No JSON object found in model response.");
+  }
+  return JSON.parse(cleaned.slice(start, end + 1));
+}
+
+async function getModelSettings() {
+  const { apiProvider, apiKey, apiModel } = await chrome.storage.local.get([
+    "apiProvider",
+    "apiKey",
+    "apiModel"
+  ]);
+
+  const provider = apiProvider || "openrouter";
+
+  if (!["openrouter", "gemini"].includes(provider)) {
+    throw new Error("Invalid provider. Choose OpenRouter or Gemini in extension settings.");
+  }
+
+  if (!apiKey?.trim()) {
+    throw new Error("No API key found. Open extension settings, paste your API key, and save.");
+  }
+
+  return {
+    provider,
+    apiKey: apiKey.trim(),
+    model: apiModel?.trim() || DEFAULT_MODELS[provider]
+  };
 }
 
 async function streamOpenRouter(apiKey, model, messages, onChunk) {
@@ -195,51 +264,35 @@ async function streamOpenRouter(apiKey, model, messages, onChunk) {
 
   if (!response.ok || !response.body) {
     const errorText = await response.text().catch(() => "");
-    throw new Error(
-      `OpenRouter request failed (${response.status}): ${errorText.slice(0, 250)}`
-    );
+    throw new Error(`OpenRouter request failed (${response.status}): ${errorText.slice(0, 250)}`);
   }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-
   let fullText = "";
   let buffer = "";
 
   while (true) {
     const { done, value } = await reader.read();
-
-    if (done) {
-      break;
-    }
+    if (done) break;
 
     buffer += decoder.decode(value, { stream: true });
-
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
 
     for (const line of lines) {
-      if (!line.startsWith("data: ")) {
-        continue;
-      }
-
+      if (!line.startsWith("data: ")) continue;
       const data = line.slice(6).trim();
-
-      if (!data || data === "[DONE]") {
-        continue;
-      }
+      if (!data || data === "[DONE]") continue;
 
       try {
         const parsed = JSON.parse(data);
         const delta = parsed.choices?.[0]?.delta?.content;
-
         if (delta) {
           fullText += delta;
           onChunk(delta, fullText);
         }
-      } catch {
-        // Ignore partial SSE fragments.
-      }
+      } catch {}
     }
   }
 
@@ -258,448 +311,113 @@ async function streamGemini(apiKey, model, parts, onChunk) {
       "x-goog-api-key": apiKey
     },
     body: JSON.stringify({
-      contents: [
-        {
-          role: "user",
-          parts
-        }
-      ]
+      contents: [{ role: "user", parts }]
     })
   });
 
   if (!response.ok || !response.body) {
     const errorText = await response.text().catch(() => "");
-    throw new Error(
-      `Gemini request failed (${response.status}): ${errorText.slice(0, 250)}`
-    );
+    throw new Error(`Gemini request failed (${response.status}): ${errorText.slice(0, 250)}`);
   }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-
   let fullText = "";
   let buffer = "";
 
   while (true) {
     const { done, value } = await reader.read();
-
-    if (done) {
-      break;
-    }
+    if (done) break;
 
     buffer += decoder.decode(value, { stream: true });
-
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
 
     for (const line of lines) {
-      if (!line.startsWith("data: ")) {
-        continue;
-      }
-
+      if (!line.startsWith("data: ")) continue;
       const data = line.slice(6).trim();
-
-      if (!data) {
-        continue;
-      }
+      if (!data) continue;
 
       try {
         const parsed = JSON.parse(data);
         const delta =
-          parsed.candidates?.[0]?.content?.parts
-            ?.map((part) => part.text || "")
-            .join("") || "";
-
+          parsed.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
         if (delta) {
           fullText += delta;
           onChunk(delta, fullText);
         }
-      } catch {
-        // Ignore partial SSE fragments.
-      }
+      } catch {}
     }
   }
 
   return fullText;
 }
 
-function parseStructuredSummary(fullText) {
-  const cleaned = fullText.replace(/```json/gi, "").replace(/```/g, "").trim();
+async function summarizeTextOnce(tabId, text, title, url, domain) {
+  const settings = await getModelSettings();
 
-  const jsonStart = cleaned.indexOf("{");
-  const jsonEnd = cleaned.lastIndexOf("}");
+  let prompt;
+  if (domain === "github_pr") prompt = buildGitHubPrPrompt(text, title, url);
+  else if (domain === "gmail_thread") prompt = buildGmailPrompt(text, title, url);
+  else if (domain === "jira") prompt = buildJiraPrompt(text, title, url);
+  else if (domain === "pdf") prompt = buildPdfPrompt(text, title, url);
+  else prompt = buildGenericPrompt(text, title, url);
 
-  if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
-    throw new Error("No valid JSON object found in the model response.");
-  }
+  safeSendMessage(tabId, { type: "SUMMARY_START" });
 
-  return JSON.parse(cleaned.slice(jsonStart, jsonEnd + 1));
-}
-
-function normalizeTextSummary(summary) {
-  const confidenceValues = ["high", "medium", "low"];
-
-  return {
-    twoLineSummary:
-      typeof summary.twoLineSummary === "string"
-        ? summary.twoLineSummary.trim()
-        : "",
-    keyPoints: Array.isArray(summary.keyPoints) ? summary.keyPoints : [],
-    actionItems: Array.isArray(summary.actionItems) ? summary.actionItems : [],
-    decisions: Array.isArray(summary.decisions) ? summary.decisions : [],
-    numbers: Array.isArray(summary.numbers) ? summary.numbers : [],
-    confidence: confidenceValues.includes(summary.confidence)
-      ? summary.confidence
-      : "medium",
-    confidenceReason:
-      typeof summary.confidenceReason === "string"
-        ? summary.confidenceReason.trim()
-        : "Confidence was estimated from the readable source content.",
-    unreadableSections: Array.isArray(summary.unreadableSections)
-      ? summary.unreadableSections
-      : []
-  };
-}
-
-function applyVisualTrustGuard(summary) {
-  const normalized = normalizeTextSummary(summary);
-
-  if (normalized.confidence === "high") {
-    normalized.confidence = "medium";
-  }
-
-  const reason = normalized.confidenceReason || "";
-
-  normalized.confidenceReason =
-    `${reason} `.trim() +
-    "Confidence is capped for screenshot-region summaries because visual content can be cropped, blurry, or partially unreadable.";
-
-  if (
-    !normalized.unreadableSections.some((item) =>
-      String(item).toLowerCase().includes("visual")
-    )
-  ) {
-    normalized.unreadableSections.unshift(
-      "Visual-source limitation: screenshot text, labels, or details may be cropped, small, or partially unreadable."
+  let raw = "";
+  if (settings.provider === "openrouter") {
+    raw = await streamOpenRouter(
+      settings.apiKey,
+      settings.model,
+      [{ role: "user", content: prompt }],
+      (_, fullText) => {
+        raw = fullText;
+      }
+    );
+  } else {
+    raw = await streamGemini(
+      settings.apiKey,
+      settings.model,
+      [{ text: prompt }],
+      (_, fullText) => {
+        raw = fullText;
+      }
     );
   }
 
-  return normalized;
+  const parsed = normalizeSummary(parseJsonFromText(raw));
+  safeSendMessage(tabId, { type: "SUMMARY_DONE", structured: parsed });
 }
 
-function chunkText(text, targetSize = 7000, overlap = 400) {
-  const paragraphs = String(text || "")
-    .replace(/\r\n/g, "\n")
-    .split(/\n{2,}/)
-    .map((part) => part.trim())
-    .filter(Boolean);
+async function summarizePage(tabId, payload, senderTabUrl) {
+  const text = payload.pageText || "";
+  const title = payload.title || "";
+  const url = payload.url || senderTabUrl || "";
+  const domain = detectDomain(payload.domainHint || url);
 
-  const chunks = [];
-  let current = "";
-
-  function pushCurrent() {
-    const trimmed = current.trim();
-    if (trimmed) {
-      chunks.push(trimmed);
-    }
-    current = "";
-  }
-
-  for (const paragraph of paragraphs) {
-    const candidate =
-      current.length > 0 ? `${current}\n\n${paragraph}` : paragraph;
-
-    if (candidate.length <= targetSize) {
-      current = candidate;
-      continue;
-    }
-
-    if (current.trim()) {
-      pushCurrent();
-    }
-
-    if (paragraph.length <= targetSize) {
-      current = paragraph;
-      continue;
-    }
-
-    // Hard split for very long paragraphs.
-    let start = 0;
-    while (start < paragraph.length) {
-      const end = Math.min(start + targetSize, paragraph.length);
-      chunks.push(paragraph.slice(start, end));
-      start = end - overlap;
-      if (start < 0) start = 0;
-      if (start >= paragraph.length) break;
-    }
-  }
-
-  pushCurrent();
-
-  return chunks.length ? chunks : [String(text || "").trim()].filter(Boolean);
-}
-
-function extractChunkSummaryText(summary) {
-  const points = Array.isArray(summary.keyPoints) ? summary.keyPoints : [];
-  const actions = Array.isArray(summary.actionItems) ? summary.actionItems : [];
-  const decisions = Array.isArray(summary.decisions) ? summary.decisions : [];
-  const numbers = Array.isArray(summary.numbers) ? summary.numbers : [];
-
-  return [
-    `Summary: ${summary.twoLineSummary || ""}`,
-    points.length ? `Key points:\n- ${points.join("\n- ")}` : "Key points: None",
-    actions.length ? `Action items:\n- ${actions.join("\n- ")}` : "Action items: None",
-    decisions.length ? `Decisions:\n- ${decisions.join("\n- ")}` : "Decisions: None",
-    numbers.length ? `Numbers:\n- ${numbers.join("\n- ")}` : "Numbers: None",
-    `Confidence: ${summary.confidence || "medium"}`,
-    `Confidence reason: ${summary.confidenceReason || ""}`
-  ].join("\n\n");
-}
-
-async function getModelSettings() {
-  const { apiProvider, apiKey, apiModel } = await chrome.storage.local.get([
-    "apiProvider",
-    "apiKey",
-    "apiModel"
-  ]);
-
-  const provider = apiProvider || "openrouter";
-
-  if (!["openrouter", "gemini"].includes(provider)) {
-    throw new Error(
-      "Invalid provider. Choose OpenRouter or Gemini in extension settings."
-    );
-  }
-
-  if (!apiKey?.trim()) {
-    throw new Error(
-      "No API key found. Open extension settings, paste your API key, and save."
-    );
-  }
-
-  return {
-    provider,
-    apiKey: apiKey.trim(),
-    model: apiModel?.trim() || DEFAULT_MODELS[provider]
-  };
-}
-
-async function runSummary(tabId, request) {
-  let settings;
-
-  try {
-    settings = await getModelSettings();
-  } catch (error) {
+  if (domain === "pdf" || isPdfLikePage(url)) {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
-      message: error.message
+      message: "This looks like a PDF, but PDF text extraction is not yet bundled. Use visual region capture for now."
     });
     return;
   }
 
-  safeSendMessage(tabId, {
-    type: "SUMMARY_START"
-  });
-
-  const onChunk = (chunk, fullText) => {
+  if (!text || text.trim().length < 20) {
     safeSendMessage(tabId, {
-      type: "SUMMARY_STREAM",
-      chunk,
-      fullText
+      type: "SUMMARY_ERROR",
+      message: "Could not find readable text on this page. Try Summarize visual region for image-based content."
     });
-  };
-
-  let fullText = "";
+    return;
+  }
 
   try {
-    if (settings.provider === "openrouter") {
-      fullText = await streamOpenRouter(
-        settings.apiKey,
-        settings.model,
-        request.openRouterMessages,
-        onChunk
-      );
-    } else {
-      fullText = await streamGemini(
-        settings.apiKey,
-        settings.model,
-        request.geminiParts,
-        onChunk
-      );
-    }
+    await summarizeTextOnce(tabId, text, title, url, domain);
   } catch (error) {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
       message: error.message || "The model request failed."
-    });
-    return;
-  }
-
-  try {
-    const parsedSummary = parseStructuredSummary(fullText);
-
-    const structured =
-      request.captureMode === "region"
-        ? applyVisualTrustGuard(parsedSummary)
-        : normalizeTextSummary(parsedSummary);
-
-    safeSendMessage(tabId, {
-      type: "SUMMARY_DONE",
-      structured
-    });
-  } catch {
-    safeSendMessage(tabId, {
-      type: "SUMMARY_ERROR",
-      message:
-        "The model returned an invalid structured response. Try again or select another model.",
-      rawText: fullText
-    });
-  }
-}
-
-async function summarizeText(tabId, payload) {
-  const { pageText, title, url, captureMode } = payload;
-
-  if (!pageText || pageText.trim().length < 20) {
-    safeSendMessage(tabId, {
-      type: "SUMMARY_ERROR",
-      message:
-        "Could not find readable text on this page. Try Summarize visual region for image-based content."
-    });
-    return;
-  }
-
-  const chunks = chunkText(pageText, 7000, 400);
-
-  if (chunks.length <= 1) {
-    const prompt = buildTextPrompt(pageText, title, url);
-
-    await runSummary(tabId, {
-      captureMode: captureMode || "page",
-      openRouterMessages: [
-        {
-          role: "user",
-          content: prompt
-        }
-      ],
-      geminiParts: [
-        {
-          text: prompt
-        }
-      ]
-    });
-
-    return;
-  }
-
-  safeSendMessage(tabId, {
-    type: "SUMMARY_STATUS",
-    message: `Splitting long text into ${chunks.length} chunks...`
-  });
-
-  const chunkSummaries = [];
-
-  for (let i = 0; i < chunks.length; i += 1) {
-    const chunk = chunks[i];
-    const chunkIndex = i + 1;
-    const prompt = buildChunkPrompt(chunk, chunkIndex, chunks.length, title, url);
-
-    safeSendMessage(tabId, {
-      type: "SUMMARY_STATUS",
-      message: `Summarizing chunk ${chunkIndex} of ${chunks.length}...`
-    });
-
-    let chunkRaw = "";
-
-    if ((await getModelSettings()).provider === "openrouter") {
-      chunkRaw = await streamOpenRouter(
-        (await getModelSettings()).apiKey,
-        (await getModelSettings()).model,
-        [
-          {
-            role: "user",
-            content: prompt
-          }
-        ],
-        () => {}
-      );
-    } else {
-      chunkRaw = await streamGemini(
-        (await getModelSettings()).apiKey,
-        (await getModelSettings()).model,
-        [
-          {
-            text: prompt
-          }
-        ],
-        () => {}
-      );
-    }
-
-    const chunkParsed = normalizeTextSummary(parseStructuredSummary(chunkRaw));
-    chunkSummaries.push(
-      `CHUNK ${chunkIndex} OF ${chunks.length}\n` +
-      extractChunkSummaryText(chunkParsed)
-    );
-  }
-
-  const reducePrompt = buildReducePrompt(
-    chunkSummaries.join("\n\n---\n\n"),
-    title,
-    url
-  );
-
-  safeSendMessage(tabId, {
-    type: "SUMMARY_STATUS",
-    message: "Combining chunk summaries..."
-  });
-
-  const settings = await getModelSettings();
-
-  let combinedRaw = "";
-
-  if (settings.provider === "openrouter") {
-    combinedRaw = await streamOpenRouter(
-      settings.apiKey,
-      settings.model,
-      [
-        {
-          role: "user",
-          content: reducePrompt
-        }
-      ],
-      (chunk, fullText) => {
-        combinedRaw = fullText;
-      }
-    );
-  } else {
-    combinedRaw = await streamGemini(
-      settings.apiKey,
-      settings.model,
-      [
-        {
-          text: reducePrompt
-        }
-      ],
-      (chunk, fullText) => {
-        combinedRaw = fullText;
-      }
-    );
-  }
-
-  try {
-    const parsedSummary = parseStructuredSummary(combinedRaw);
-
-    safeSendMessage(tabId, {
-      type: "SUMMARY_DONE",
-      structured: normalizeTextSummary(parsedSummary)
-    });
-  } catch {
-    safeSendMessage(tabId, {
-      type: "SUMMARY_ERROR",
-      message:
-        "The final combined response could not be parsed as JSON.",
-      rawText: combinedRaw
     });
   }
 }
@@ -707,19 +425,10 @@ async function summarizeText(tabId, payload) {
 async function captureRegion(sender, payload) {
   const tabId = sender.tab?.id;
   const windowId = sender.tab?.windowId;
-
-  if (!tabId || windowId === undefined) {
-    return;
-  }
+  if (!tabId || windowId === undefined) return;
 
   try {
-    const screenshotDataUrl = await chrome.tabs.captureVisibleTab(
-      windowId,
-      {
-        format: "png"
-      }
-    );
-
+    const screenshotDataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
     safeSendMessage(tabId, {
       type: "REGION_SCREENSHOT",
       screenshotDataUrl,
@@ -728,8 +437,7 @@ async function captureRegion(sender, payload) {
   } catch {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
-      message:
-        "Could not capture the selected region. Ensure the page is active, then try again."
+      message: "Could not capture the selected region. Ensure the page is active, then try again."
     });
   }
 }
@@ -745,90 +453,54 @@ async function summarizeImage(tabId, payload) {
     return;
   }
 
-  const base64Data = imageDataUrl.split(",")[1];
+  const settings = await getModelSettings();
+  const prompt = buildImagePrompt(title, url);
+  let raw = "";
 
-  if (!base64Data) {
+  try {
+    if (settings.provider === "openrouter") {
+      raw = await streamOpenRouter(
+        settings.apiKey,
+        settings.model,
+        [{
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            { type: "image_url", image_url: { url: imageDataUrl } }
+          ]
+        }],
+        (_, fullText) => {
+          raw = fullText;
+        }
+      );
+    } else {
+      const base64Data = imageDataUrl.split(",")[1];
+      raw = await streamGemini(
+        settings.apiKey,
+        settings.model,
+        [
+          { text: prompt },
+          { inline_data: { mime_type: mimeType, data: base64Data } }
+        ],
+        (_, fullText) => {
+          raw = fullText;
+        }
+      );
+    }
+
+    const parsed = normalizeSummary(parseJsonFromText(raw));
+    safeSendMessage(tabId, { type: "SUMMARY_DONE", structured: capVisual(parsed) });
+  } catch (error) {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
-      message: "The selected screenshot image is invalid."
-    });
-    return;
-  }
-
-  const prompt = buildImagePrompt(title, url);
-
-  const settings = await getModelSettings();
-
-  if (settings.provider === "openrouter") {
-    await runSummary(tabId, {
-      captureMode: "region",
-      openRouterMessages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: prompt
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: imageDataUrl
-              }
-            }
-          ]
-        }
-      ],
-      geminiParts: [
-        {
-          text: prompt
-        },
-        {
-          inline_data: {
-            mime_type: mimeType,
-            data: base64Data
-          }
-        }
-      ]
-    });
-  } else {
-    await runSummary(tabId, {
-      captureMode: "region",
-      openRouterMessages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: prompt
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: imageDataUrl
-              }
-            }
-          ]
-        }
-      ],
-      geminiParts: [
-        {
-          text: prompt
-        },
-        {
-          inline_data: {
-            mime_type: mimeType,
-            data: base64Data
-          }
-        }
-      ]
+      message: error.message || "The visual summary request failed."
     });
   }
 }
 
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message.type === "SUMMARIZE_PAGE" && sender.tab?.id) {
-    summarizeText(sender.tab.id, message.payload);
+    summarizePage(sender.tab.id, message.payload, sender.tab.url || "");
   }
 
   if (message.type === "CAPTURE_REGION") {

@@ -3,7 +3,9 @@
 // Supports:
 // - Whole page text summarization
 // - Current text-selection summarization
-// - User-drawn screenshot region summarization
+// - Visual region screenshot summarization
+// - Domain-aware mode hints
+// - PDF detection hints
 // - Structured streaming output
 // - Clipboard copy and Markdown export
 
@@ -21,6 +23,51 @@
   let lastStructured = null;
   let lastRawStream = "";
   let activeCaptureMode = "page";
+
+  function isPdfLikePage() {
+    const url = String(location.href || "").toLowerCase();
+    const contentType = String(document.contentType || "").toLowerCase();
+
+    return (
+      url.endsWith(".pdf") ||
+      url.includes(".pdf?") ||
+      contentType === "application/pdf" ||
+      document.querySelector("embed[type='application/pdf']") !== null ||
+      document.querySelector("iframe[src*='.pdf']") !== null
+    );
+  }
+
+  function detectDomainHint() {
+    const url = String(location.href || "").toLowerCase();
+
+    if (isPdfLikePage()) {
+      return "pdf";
+    }
+
+    if (url.includes("github.com") && url.includes("/pull/")) {
+      return "github_pr";
+    }
+
+    if (url.includes("mail.google.com")) {
+      return "gmail_thread";
+    }
+
+    if (url.includes("jira.") || url.includes("/browse/") || url.includes("/jira")) {
+      return "jira";
+    }
+
+    return "generic";
+  }
+
+  function getModeLabel(mode) {
+    if (mode === "selection") return "Selected text";
+    if (mode === "region") return "Selected screenshot region";
+    if (mode === "pdf") return "PDF document";
+    if (mode === "github_pr") return "GitHub pull request";
+    if (mode === "gmail_thread") return "Gmail thread";
+    if (mode === "jira") return "Jira page";
+    return "Full page text";
+  }
 
   function getPageText() {
     const contentRoot =
@@ -84,7 +131,7 @@
       }
 
       .panel {
-        width: 400px;
+        width: 420px;
         max-height: 90vh;
         margin: 12px;
         display: flex;
@@ -109,6 +156,12 @@
         border-bottom: 1px solid #393944;
       }
 
+      .title-wrap {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+
       .title {
         color: #ffffff;
         font-size: 14px;
@@ -116,7 +169,7 @@
       }
 
       .subtitle {
-        max-width: 320px;
+        max-width: 340px;
         margin-top: 2px;
         overflow: hidden;
         color: #9d9daa;
@@ -148,6 +201,16 @@
         overflow-y: auto;
         font-size: 13px;
         line-height: 1.55;
+      }
+
+      .meta {
+        margin-bottom: 12px;
+        padding: 8px 10px;
+        color: #bcbccd;
+        font-size: 11px;
+        background: #15151b;
+        border: 1px solid #2f2f39;
+        border-radius: 8px;
       }
 
       .capture-actions {
@@ -294,7 +357,7 @@
 
     panel.innerHTML = `
       <div class="header">
-        <div>
+        <div class="title-wrap">
           <div class="title">Inline Summarizer</div>
           <div class="subtitle">${escapeHTML(document.title)}</div>
         </div>
@@ -361,7 +424,13 @@
   }
 
   function renderCaptureMenu() {
+    const domainHint = detectDomainHint();
+
     setBodyHTML(`
+      <div class="meta">
+        Detected mode: <strong>${escapeHTML(getModeLabel(domainHint))}</strong>
+      </div>
+
       <div class="intro">
         Choose what you want to summarize.
       </div>
@@ -454,6 +523,7 @@
   async function startTextSummary(mode) {
     activeCaptureMode = mode;
 
+    const domainHint = detectDomainHint();
     const pageText =
       mode === "selection"
         ? getSelectionText()
@@ -467,9 +537,15 @@
     }
 
     if (mode === "page" && pageText.length < 20) {
-      showError(
-        "Could not find readable page text. Try Summarize visual region for images, charts, e-paper pages, or canvas dashboards."
-      );
+      if (domainHint === "pdf") {
+        showError(
+          "This looks like a PDF, but readable PDF text is not yet wired in. Use visual region capture for now."
+        );
+      } else {
+        showError(
+          "Could not find readable page text. Try Summarize visual region for image-based content."
+        );
+      }
       return;
     }
 
@@ -482,7 +558,7 @@
     setBodyHTML(`
       <div class="status">
         <span class="spinner"></span>
-        Reading ${mode === "selection" ? "selected text" : "page"} and contacting model...
+        Reading ${getModeLabel(mode === "page" ? domainHint : mode)} and contacting model...
       </div>
     `);
 
@@ -496,7 +572,8 @@
               ? `Selection from ${document.title}`
               : document.title,
           url: location.href,
-          captureMode: mode
+          captureMode: mode === "page" ? domainHint : mode,
+          domainHint
         }
       });
     } catch (error) {
@@ -508,7 +585,6 @@
   function startRegionSelection() {
     activeCaptureMode = "region";
 
-    // The panel must be hidden before capture so it is not included in screenshot.
     hidePanel();
 
     const overlay = document.createElement("div");
@@ -630,7 +706,6 @@
       `);
 
       try {
-        // Give Chrome a moment to repaint without the overlay and panel.
         await new Promise((resolve) => setTimeout(resolve, 100));
 
         await sendRuntimeMessage({
@@ -729,6 +804,13 @@
         message.rect
       );
 
+      setBodyHTML(`
+        <div class="status">
+          <span class="spinner"></span>
+          Preparing grounded visual summary...
+        </div>
+      `);
+
       await sendRuntimeMessage({
         type: "SUMMARIZE_IMAGE",
         payload: {
@@ -740,7 +822,7 @@
       });
     } catch (error) {
       console.error(error);
-      showError(error.message);
+      showError(error.message || "Could not prepare the selected screenshot region.");
     }
   }
 
@@ -761,11 +843,7 @@
   function renderStructuredSummary(summary) {
     lastStructured = summary;
 
-    const sourceLabel = {
-      page: "Full page text",
-      selection: "Selected text",
-      region: "Selected screenshot region"
-    }[activeCaptureMode];
+    const sourceLabel = getModeLabel(activeCaptureMode);
 
     setBodyHTML(`
       <div class="summary-text">
@@ -796,9 +874,17 @@
 
       <div class="section-title">Details</div>
       <div class="status">
-        Source: ${escapeHTML(sourceLabel)} ·
-        Confidence: ${escapeHTML(summary.confidence || "unknown")}
+        Source: ${escapeHTML(sourceLabel)} · Confidence: ${escapeHTML(summary.confidence || "unknown")}
       </div>
+
+      ${
+        summary.confidenceReason
+          ? `
+            <div class="section-title">Confidence reason</div>
+            <div class="status">${escapeHTML(summary.confidenceReason)}</div>
+          `
+          : ""
+      }
 
       <div class="section-title">Summarize something else</div>
 
@@ -842,11 +928,7 @@
       return items.map((item) => `- ${item}`).join("\n");
     };
 
-    const sourceLabel = {
-      page: "Full page text",
-      selection: "Selected text",
-      region: "Selected screenshot region"
-    }[activeCaptureMode];
+    const sourceLabel = getModeLabel(activeCaptureMode);
 
     return `# Summary of ${document.title}
 
@@ -871,6 +953,8 @@ ${listToMarkdown(summary.numbers)}
 ${listToMarkdown(summary.unreadableSections)}
 
 Confidence: ${summary.confidence || "unknown"}
+
+${summary.confidenceReason ? `Confidence reason: ${summary.confidenceReason}` : ""}
 `;
   }
 
@@ -930,6 +1014,18 @@ Confidence: ${summary.confidence || "unknown"}
 
     if (message.type === "REGION_SCREENSHOT") {
       handleRegionScreenshot(message);
+      return;
+    }
+
+    if (message.type === "SUMMARY_STATUS") {
+      setBodyHTML(`
+        <div class="status">
+          <span class="spinner"></span>
+          ${escapeHTML(message.message || "Working...")}
+        </div>
+
+        <div class="raw-stream" id="raw-stream"></div>
+      `);
       return;
     }
 

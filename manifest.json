@@ -3,7 +3,7 @@
   "name": "Inline Summarizer",
   "version": "0.2.0",
   "description": "Summarize the page, selection, or region in place without leaving the tab.",
-  "permissions": ["activeTab", "scripting", "storage", "commands", "clipboardWrite"],
+  "permissions": ["activeTab", "scripting", "storage", "commands", "clipboardWrite","offscreen"],
   "host_permissions": [
   "https://openrouter.ai/*",
   "https://generativelanguage.googleapis.com/*"
