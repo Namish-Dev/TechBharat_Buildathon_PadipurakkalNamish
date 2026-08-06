@@ -83,6 +83,6 @@ npm install
 
 ## **Notes**
 
-- We recommend Gemini models for summarization because they typically provide lower latency in this application.
+- Recommended Gemini models for summarization because they typically provide lower latency in this application.
 - The **Summarize Visual Region** feature requires a Vision Language Model (VLM).
 - Translation and document structuring quality depend on the selected LLM. In general, more capable models produce higher-quality results.
