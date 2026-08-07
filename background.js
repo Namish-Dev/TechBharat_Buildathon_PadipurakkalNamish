@@ -1,19 +1,24 @@
-// background.js — fast, simplified MV3 service worker
+// background.js — fast MV3 service worker with simple streaming
 // - Single-pass text summarization for normal pages
-// - Domain-aware prompts
-// - Visual region summarization kept
-// - PDF fallback kept honest
-// - No chunking pipeline
+// - Domain-aware prompts (generic, GitHub PR, Gmail, Jira)
+// - Visual region summarization
+// - PDF fallback (no extraction)
+// - Streams fullText only (no delta field)
 
 const DEFAULT_MODELS = {
-  openrouter: "google/gemma-4-a4b-it:free",
+  openrouter: "google/gemini-2.0-flash-001",
   gemini: "gemini-3.5-flash"
 };
+
+const REQUEST_TIMEOUT_MS = 60000;
 
 function safeSendMessage(tabId, message) {
   chrome.tabs.sendMessage(tabId, message, () => {
     if (chrome.runtime.lastError) {
-      console.warn("Inline Summarizer message was not delivered:", chrome.runtime.lastError.message);
+      console.warn(
+        "Inline Summarizer message was not delivered:",
+        chrome.runtime.lastError.message
+      );
     }
   });
 }
@@ -65,14 +70,16 @@ Rules:
 - Be faithful.
 - Do not invent.
 - Keep it concise.
-- If content is partial or unclear, say so in unreadableSections.`;
+- In the keypoints maximum is 10 items, each under 200 characters.
+- If content is partial or unclear, say so in unreadableSections.
+- Specifically check whether the provided text stops abruptly mid-article — e.g. it ends with a paywall prompt, a "subscribe to continue reading" message, a truncated sentence, or a sudden shift to unrelated boilerplate (related articles, footer links, comments). If so, you MUST add an entry to unreadableSections stating that the content appears cut off by a paywall or truncation point, and only summarize what was actually provided.`;
 }
 
 function buildGenericPrompt(text, title, url) {
-  return `You are summarizing a web page for a knowledge worker.
+  return `Summarize the following page faithfully for a knowledge worker.
 
-Page title: ${title}
-Page URL: ${url}
+Title: ${title}
+URL: ${url}
 
 ${getSchema()}
 
@@ -83,7 +90,7 @@ ${text}
 }
 
 function buildGitHubPrPrompt(text, title, url) {
-  return `You are summarizing a GitHub pull request for a reviewer.
+  return `Summarize the following GitHub pull request for a reviewer.
 
 PR title: ${title}
 PR URL: ${url}
@@ -102,7 +109,7 @@ ${text}
 }
 
 function buildGmailPrompt(text, title, url) {
-  return `You are summarizing a Gmail thread.
+  return `Summarize the following Gmail thread.
 
 Thread title: ${title}
 Thread URL: ${url}
@@ -120,7 +127,7 @@ ${text}
 }
 
 function buildJiraPrompt(text, title, url) {
-  return `You are summarizing a Jira page or board.
+  return `Summarize the following Jira page or board.
 
 Page title: ${title}
 Page URL: ${url}
@@ -139,7 +146,7 @@ ${text}
 }
 
 function buildPdfPrompt(text, title, url) {
-  return `You are summarizing a PDF document.
+  return `Summarize the following PDF document.
 
 Document title: ${title}
 Document URL: ${url}
@@ -158,7 +165,7 @@ ${text}
 }
 
 function buildImagePrompt(title, url) {
-  return `You are analyzing a screenshot region from a webpage.
+  return `Summarize the visible content of this screenshot region.
 
 Page title: ${title}
 Page URL: ${url}
@@ -167,10 +174,7 @@ ${getSchema()}
 
 Visual rules:
 - Only report what is directly visible.
-- Do not guess cropped or blurry names or numbers.
-- Prefer broader topics when visibility is limited.
-
-SCREENSHOT REGION`;
+- Prefer broader topics when visibility is limited.`;
 }
 
 function detectDomain(url) {
@@ -188,23 +192,40 @@ function isPdfLikePage(url) {
 
 function normalizeSummary(summary) {
   const allowed = ["high", "medium", "low"];
+
   return {
-    twoLineSummary: typeof summary.twoLineSummary === "string" ? summary.twoLineSummary.trim() : "",
+    twoLineSummary:
+      typeof summary.twoLineSummary === "string"
+        ? summary.twoLineSummary.trim()
+        : "",
     keyPoints: Array.isArray(summary.keyPoints) ? summary.keyPoints : [],
     actionItems: Array.isArray(summary.actionItems) ? summary.actionItems : [],
     decisions: Array.isArray(summary.decisions) ? summary.decisions : [],
     numbers: Array.isArray(summary.numbers) ? summary.numbers : [],
-    confidence: allowed.includes(summary.confidence) ? summary.confidence : "medium",
-    confidenceReason: typeof summary.confidenceReason === "string" ? summary.confidenceReason.trim() : "",
-    unreadableSections: Array.isArray(summary.unreadableSections) ? summary.unreadableSections : []
+    confidence: allowed.includes(summary.confidence)
+      ? summary.confidence
+      : "medium",
+    confidenceReason:
+      typeof summary.confidenceReason === "string"
+        ? summary.confidenceReason.trim()
+        : "",
+    unreadableSections: Array.isArray(summary.unreadableSections)
+      ? summary.unreadableSections
+      : []
   };
 }
 
 function capVisual(summary) {
   const s = normalizeSummary(summary);
   if (s.confidence === "high") s.confidence = "medium";
-  if (!s.unreadableSections.some((x) => String(x).toLowerCase().includes("visual"))) {
-    s.unreadableSections.unshift("Visual-source limitation: screenshot text or labels may be cropped, small, or partially unreadable.");
+  if (
+    !s.unreadableSections.some((x) =>
+      String(x).toLowerCase().includes("visual")
+    )
+  ) {
+    s.unreadableSections.unshift(
+      "Visual-source limitation: screenshot text or labels may be cropped, small, or partially unreadable."
+    );
   }
   if (!s.confidenceReason) {
     s.confidenceReason = "Confidence capped because the source is a screenshot region.";
@@ -212,14 +233,84 @@ function capVisual(summary) {
   return s;
 }
 
+const KNOWN_GEMINI_MODELS = {
+  "gemini-3.5-flash": "gemini-2.5-flash",
+  "gemini-3.6-flash": "gemini-2.5-flash",
+  "gemini-3.0-flash": "gemini-2.5-flash",
+  "gemini-3.5-pro": "gemini-1.5-pro"
+};
+
+function normalizeModelName(provider, model) {
+  if (!model) return DEFAULT_MODELS[provider];
+  const trimmed = model.trim();
+  if (provider === "gemini" && KNOWN_GEMINI_MODELS[trimmed.toLowerCase()]) {
+    return KNOWN_GEMINI_MODELS[trimmed.toLowerCase()];
+  }
+  return trimmed;
+}
+
 function parseJsonFromText(text) {
-  const cleaned = String(text || "").replace(/```json/gi, "").replace(/```/g, "").trim();
+  const cleaned = String(text || "")
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+
   const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) {
+  if (start === -1) {
     throw new Error("No JSON object found in model response.");
   }
-  return JSON.parse(cleaned.slice(start, end + 1));
+
+  let lastIndex = cleaned.length;
+  while (true) {
+    const end = cleaned.lastIndexOf("}", lastIndex);
+    if (end === -1 || end <= start) break;
+
+    const candidate = cleaned.slice(start, end + 1);
+    try {
+      return JSON.parse(candidate);
+    } catch (e) {
+      lastIndex = end - 1;
+    }
+  }
+
+  const sanitized = cleaned.slice(start)
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, "")
+    .replace(/,\s*([\}\]])/g, "$1");
+
+  lastIndex = sanitized.length;
+  while (true) {
+    const end = sanitized.lastIndexOf("}", lastIndex);
+    if (end === -1 || end <= 0) break;
+
+    const candidate = sanitized.slice(0, end + 1);
+    try {
+      return JSON.parse(candidate);
+    } catch (e) {
+      lastIndex = end - 1;
+    }
+  }
+
+  throw new Error("Could not parse valid JSON from model response.");
+}
+
+// Some providers/proxies keep the HTTP stream open for a while after the
+// model has actually finished emitting the JSON — sitting in the read loop
+// waiting for a formal "done" from the connection can hang the whole
+// request even though nothing has actually failed. This lets us detect
+// completion from the CONTENT itself and stop reading early, instead of
+// depending on the connection to close.
+function looksJsonComplete(text) {
+  const trimmed = String(text || "")
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+  if (!trimmed.endsWith("}")) return false;
+  try {
+    const parsed = parseJsonFromText(trimmed);
+    return !!parsed && typeof parsed === "object" && "twoLineSummary" in parsed;
+  } catch {
+    return false;
+  }
 }
 
 async function getModelSettings() {
@@ -234,19 +325,18 @@ async function getModelSettings() {
   if (!["openrouter", "gemini"].includes(provider)) {
     throw new Error("Invalid provider. Choose OpenRouter or Gemini in extension settings.");
   }
-
   if (!apiKey?.trim()) {
     throw new Error("No API key found. Open extension settings, paste your API key, and save.");
   }
 
+  const rawModel = apiModel?.trim() || DEFAULT_MODELS[provider];
+
   return {
     provider,
     apiKey: apiKey.trim(),
-    model: apiModel?.trim() || DEFAULT_MODELS[provider]
+    model: normalizeModelName(provider, rawModel)
   };
 }
-
-const REQUEST_TIMEOUT_MS = 60000; // covers the whole streamed response, not just headers
 
 async function streamOpenRouter(apiKey, model, messages, onChunk) {
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -260,6 +350,7 @@ async function streamOpenRouter(apiKey, model, messages, onChunk) {
     body: JSON.stringify({
       model,
       stream: true,
+      temperature: 0.2,
       messages
     }),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
@@ -267,36 +358,73 @@ async function streamOpenRouter(apiKey, model, messages, onChunk) {
 
   if (!response.ok || !response.body) {
     const errorText = await response.text().catch(() => "");
-    throw new Error(`OpenRouter request failed (${response.status}): ${errorText.slice(0, 250)}`);
+    throw new Error(
+      `OpenRouter request failed (${response.status}): ${errorText.slice(0, 250)}`
+    );
   }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let fullText = "";
   let buffer = "";
+  let completed = false;
 
-  while (true) {
+  const processDataPayload = (data) => {
+    if (!data || data === "[DONE]") return;
+    try {
+      const parsed = JSON.parse(data);
+      const delta = parsed.choices?.[0]?.delta?.content || "";
+      if (delta) {
+        fullText += delta;
+        onChunk(fullText);
+        if (!completed && looksJsonComplete(fullText)) {
+          completed = true;
+        }
+      }
+    } catch {}
+  };
+
+  readLoop: while (true) {
     const { done, value } = await reader.read();
     if (done) break;
 
     buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+    const parts = buffer.split(/\r?\n\r?\n/);
+    buffer = parts.pop() || "";
 
-    for (const line of lines) {
-      if (!line.startsWith("data: ")) continue;
-      const data = line.slice(6).trim();
-      if (!data || data === "[DONE]") continue;
-
-      try {
-        const parsed = JSON.parse(data);
-        const delta = parsed.choices?.[0]?.delta?.content;
-        if (delta) {
-          fullText += delta;
-          onChunk(delta, fullText);
+    for (const part of parts) {
+      const lines = part.split(/\r?\n/);
+      const dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          dataLines.push(line.slice(6));
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5));
         }
-      } catch {}
+      }
+      // SSE spec: multiple "data:" lines in one event are joined with "\n",
+      // not concatenated directly - otherwise multi-line JSON gets corrupted.
+      processDataPayload(dataLines.join("\n").trim());
+      if (completed) break readLoop;
     }
+  }
+
+  if (!completed && buffer.trim()) {
+    const lines = buffer.split(/\r?\n/);
+    const dataLines = [];
+    for (const line of lines) {
+      if (line.startsWith("data: ")) dataLines.push(line.slice(6));
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5));
+    }
+    processDataPayload(dataLines.join("\n").trim());
+  }
+
+  if (completed) {
+    // Stop reading immediately rather than waiting for the server to close
+    // the connection - the content is already complete.
+    try {
+      await reader.cancel();
+    } catch {}
   }
 
   return fullText;
@@ -307,69 +435,97 @@ async function streamGemini(apiKey, model, parts, onChunk) {
     "https://generativelanguage.googleapis.com/v1beta/models/" +
     `${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 
-  const requestBody = {
-    contents: [{ role: "user", parts }]
-  };
-
-  // Gemini 2.5 Flash supports disabling thinking via thinkingBudget = 0.
-  // We only attach the config for 2.5 models so older models are unaffected.
-  if (String(model || "").startsWith("gemini-2.5-")) {
-    requestBody.generationConfig = {
-      thinkingConfig: {
-        thinkingBudget: 0
-      }
-    };
-  } else if (String(model || "").startsWith("gemini-3")) {
-    requestBody.generationConfig = {
-      thinkingConfig: {
-        thinkingLevel: "low"
-      }
-    };
-  }
-
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-goog-api-key": apiKey
     },
-    body: JSON.stringify(requestBody),
+    body: JSON.stringify({
+      contents: [{ role: "user", parts }],
+      systemInstruction: {
+        parts: [{ text: "You are an instant AI summarizer. Return ONLY valid JSON." }]
+      },
+      generationConfig: {
+        temperature: 0.2,
+        // Gemini 2.5 Flash runs an internal "thinking" pass by default before
+        // it emits any visible output — those reasoning tokens are what was
+        // eating 8-10s of TTFT. Setting the budget to 0 disables it so the
+        // model starts streaming the answer immediately.
+        thinkingConfig: { thinkingBudget: 0 }
+      }
+    }),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
   });
 
   if (!response.ok || !response.body) {
     const errorText = await response.text().catch(() => "");
-    throw new Error(`Gemini request failed (${response.status}): ${errorText.slice(0, 250)}`);
+    throw new Error(
+      `Gemini request failed (${response.status}): ${errorText.slice(0, 250)}`
+    );
   }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let fullText = "";
   let buffer = "";
+  let completed = false;
 
-  while (true) {
+  const processDataPayload = (data) => {
+    if (!data) return;
+    try {
+      const parsed = JSON.parse(data);
+      const delta =
+        parsed.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+      if (delta) {
+        fullText += delta;
+        onChunk(fullText);
+        if (!completed && looksJsonComplete(fullText)) {
+          completed = true;
+        }
+      }
+    } catch {}
+  };
+
+  readLoop: while (true) {
     const { done, value } = await reader.read();
     if (done) break;
 
     buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+    const parts = buffer.split(/\r?\n\r?\n/);
+    buffer = parts.pop() || "";
 
-    for (const line of lines) {
-      if (!line.startsWith("data: ")) continue;
-      const data = line.slice(6).trim();
-      if (!data) continue;
-
-      try {
-        const parsed = JSON.parse(data);
-        const delta =
-          parsed.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
-        if (delta) {
-          fullText += delta;
-          onChunk(delta, fullText);
+    for (const part of parts) {
+      const lines = part.split(/\r?\n/);
+      const dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          dataLines.push(line.slice(6));
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5));
         }
-      } catch {}
+      }
+      // SSE spec: multiple "data:" lines in one event are joined with "\n",
+      // not concatenated directly - otherwise multi-line JSON gets corrupted.
+      processDataPayload(dataLines.join("\n").trim());
+      if (completed) break readLoop;
     }
+  }
+
+  if (!completed && buffer.trim()) {
+    const lines = buffer.split(/\r?\n/);
+    const dataLines = [];
+    for (const line of lines) {
+      if (line.startsWith("data: ")) dataLines.push(line.slice(6));
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5));
+    }
+    processDataPayload(dataLines.join("\n").trim());
+  }
+
+  if (completed) {
+    try {
+      await reader.cancel();
+    } catch {}
   }
 
   return fullText;
@@ -377,7 +533,7 @@ async function streamGemini(apiKey, model, parts, onChunk) {
 
 function friendlyErrorMessage(error) {
   if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-    return "The model did not respond within 60 seconds. This can happen with slow or rate-limited free-tier models. Try again, or switch models in the extension's Settings page.";
+    return "The model did not respond within 60 seconds. Try again or switch models.";
   }
   return error?.message || "The model request failed.";
 }
@@ -392,246 +548,66 @@ async function summarizeTextOnce(tabId, text, title, url, domain) {
   else if (domain === "pdf") prompt = buildPdfPrompt(text, title, url);
   else prompt = buildGenericPrompt(text, title, url);
 
-  safeSendMessage(tabId, { type: "SUMMARY_START" });
+  const startTime = Date.now();
+  let firstTokenTime = null;
+
+  console.log(`[Inline Summarizer TTFT Debug] 🚀 Sent request to provider '${settings.provider}' using model '${settings.model}' at ${new Date(startTime).toLocaleTimeString()}.${startTime % 1000}`);
+
+  safeSendMessage(tabId, { type: "SUMMARY_START", startTime, model: settings.model });
 
   let raw = "";
-  const onChunk = (_, fullText) => {
+
+  const onChunk = (fullText) => {
     raw = fullText;
-    // content.js already listens for SUMMARY_STREAM to render live tokens;
-    // this was previously never sent, so the panel only showed a spinner
-    // until the whole response landed.
-    safeSendMessage(tabId, { type: "SUMMARY_STREAM", fullText });
-  };
+    if (!firstTokenTime) {
+      firstTokenTime = Date.now();
+      const ttftMs = firstTokenTime - startTime;
+      console.log(`[Inline Summarizer TTFT Debug] ⚡ 1ST TOKEN ARRIVED! TTFT = ${ttftMs}ms (${(ttftMs / 1000).toFixed(2)}s) for model '${settings.model}'`);
+      safeSendMessage(tabId, {
+        type: "FIRST_TOKEN_TIMING",
+        ttftMs,
+        model: settings.model
+      });
+    }
 
-  if (settings.provider === "openrouter") {
-    raw = await streamOpenRouter(settings.apiKey, settings.model, [{ role: "user", content: prompt }], onChunk);
-  } else {
-    raw = await streamGemini(settings.apiKey, settings.model, [{ text: prompt }], onChunk);
-  }
-
-  const parsed = normalizeSummary(parseJsonFromText(raw));
-  safeSendMessage(tabId, { type: "SUMMARY_DONE", structured: parsed });
-
-  // Store what was captured so the user can ask follow-up questions without
-  // re-capturing. Uses chrome.storage.session (not a plain in-memory Map)
-  // because MV3 service workers can be killed and restarted between user
-  // actions, which would silently wipe an in-memory store.
-  await saveFollowupContext(tabId, { title, url, domain, sourceText: text, structuredSummary: parsed });
-}
-
-// --- Follow-up Q&A against already-captured content ---
-// Lets the user ask things like "what did it say about pricing" against the
-// last captured page/selection/PDF without triggering a new capture.
-
-function followupContextKey(tabId) {
-  return `context:${tabId}`;
-}
-
-async function saveFollowupContext(tabId, data) {
-  try {
-    await chrome.storage.session.set({
-      [followupContextKey(tabId)]: { ...data, history: [] }
-    });
-  } catch (error) {
-    console.warn("Inline Summarizer: could not save follow-up context.", error);
-  }
-}
-
-async function getFollowupContext(tabId) {
-  try {
-    const key = followupContextKey(tabId);
-    const result = await chrome.storage.session.get(key);
-    return result[key] || null;
-  } catch {
-    return null;
-  }
-}
-
-function formatStructuredForPrompt(summary) {
-  if (!summary) return "";
-  const listify = (items) =>
-    Array.isArray(items) && items.length ? items.map((item) => `- ${item}`).join("\n") : "None detected";
-
-  return `Two-line summary: ${summary.twoLineSummary || ""}
-Key points:
-${listify(summary.keyPoints)}
-Action items:
-${listify(summary.actionItems)}
-Decisions:
-${listify(summary.decisions)}
-Numbers:
-${listify(summary.numbers)}`;
-}
-
-function buildFollowupPrompt(context, question) {
-  const historyText = (context.history || [])
-    .map((turn) => `${turn.role === "user" ? "User" : "Assistant"}: ${turn.content}`)
-    .join("\n\n");
-
-  return `You previously captured and summarized content for the user. Answer their follow-up question using ONLY the captured content below. If the answer is not present in it, say so plainly instead of guessing — do not invent details.
-
-Captured content title: ${context.title}
-Captured content URL: ${context.url}
-
-CAPTURED CONTENT:
-"""
-${context.sourceText}
-"""
-
-YOUR PREVIOUS SUMMARY:
-${formatStructuredForPrompt(context.structuredSummary)}
-
-${historyText ? `CONVERSATION SO FAR:\n${historyText}\n` : ""}
-New question: ${question}
-
-Answer conversationally in plain text (not JSON), concisely, citing specific details from the captured content where relevant.`;
-}
-
-async function askFollowup(tabId, payload) {
-  const question = String(payload?.question || "").trim();
-  if (!question) {
-    safeSendMessage(tabId, { type: "FOLLOWUP_ERROR", message: "Type a question first." });
-    return;
-  }
-
-  const context = await getFollowupContext(tabId);
-  if (!context || !context.sourceText) {
     safeSendMessage(tabId, {
-      type: "FOLLOWUP_ERROR",
-      message: "No captured content to ask about yet. Summarize the page, selection, or a region first."
+      type: "SUMMARY_STREAM",
+      fullText
     });
-    return;
-  }
-
-  let settings;
-  try {
-    settings = await getModelSettings();
-  } catch (error) {
-    safeSendMessage(tabId, { type: "FOLLOWUP_ERROR", message: error.message });
-    return;
-  }
-
-  safeSendMessage(tabId, { type: "FOLLOWUP_START" });
-
-  const prompt = buildFollowupPrompt(context, question);
-  let raw = "";
-  const onChunk = (_, fullText) => {
-    raw = fullText;
-    safeSendMessage(tabId, { type: "FOLLOWUP_STREAM", fullText });
   };
 
   try {
     if (settings.provider === "openrouter") {
-      raw = await streamOpenRouter(settings.apiKey, settings.model, [{ role: "user", content: prompt }], onChunk);
+      raw = await streamOpenRouter(
+        settings.apiKey,
+        settings.model,
+        [{ role: "user", content: prompt }],
+        onChunk
+      );
     } else {
-      raw = await streamGemini(settings.apiKey, settings.model, [{ text: prompt }], onChunk);
+      raw = await streamGemini(
+        settings.apiKey,
+        settings.model,
+        [{ text: prompt }],
+        onChunk
+      );
     }
-  } catch (error) {
-    safeSendMessage(tabId, { type: "FOLLOWUP_ERROR", message: friendlyErrorMessage(error) });
-    return;
-  }
 
-  const answer = raw.trim() || "The model did not return an answer.";
+    const totalMs = Date.now() - startTime;
+    const ttftMs = firstTokenTime ? (firstTokenTime - startTime) : totalMs;
+    console.log(`[Inline Summarizer TTFT Debug] ✅ SUMMARY COMPLETED! Total time: ${totalMs}ms (${(totalMs / 1000).toFixed(2)}s), TTFT: ${ttftMs}ms (${(ttftMs / 1000).toFixed(2)}s).`);
 
-  const history = Array.isArray(context.history) ? context.history : [];
-  history.push({ role: "user", content: question });
-  history.push({ role: "assistant", content: answer });
+    const parsed = normalizeSummary(parseJsonFromText(raw));
 
-  try {
-    await chrome.storage.session.set({
-      [followupContextKey(tabId)]: { ...context, history: history.slice(-12) } // cap to last 6 exchanges
-    });
-  } catch {}
-
-  safeSendMessage(tabId, { type: "FOLLOWUP_DONE", answer });
-}
-
-// Drop stored context once a tab closes, so chrome.storage.session doesn't
-// accumulate stale entries indefinitely.
-chrome.tabs.onRemoved.addListener((tabId) => {
-  chrome.storage.session.remove(followupContextKey(tabId)).catch(() => {});
-});
-
-// --- PDF extraction via offscreen document ---
-// offscreen.js + pdf.min.mjs already implement real pdf.js-based text
-// extraction, but nothing was creating the offscreen document or calling
-// it. summarizePage() used to hard-fail on PDFs instead. Wired up below.
-
-let offscreenReadyPromise = null;
-
-async function ensureOffscreenDocument() {
-  if (chrome.offscreen && (await chrome.offscreen.hasDocument())) return;
-
-  if (offscreenReadyPromise) {
-    await offscreenReadyPromise;
-    return;
-  }
-
-  offscreenReadyPromise = chrome.offscreen.createDocument({
-    url: "offscreen.html",
-    reasons: ["BLOBS"],
-    justification: "Parse PDF bytes into text using pdf.js so PDF pages can be summarized."
-  });
-
-  await offscreenReadyPromise;
-  offscreenReadyPromise = null;
-}
-
-function extractPdfTextViaOffscreen(pdfBase64) {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(
-      { target: "offscreen", type: "EXTRACT_PDF_TEXT", pdfBase64 },
-      (response) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        if (!response?.ok) {
-          reject(new Error(response?.error || "PDF text extraction failed."));
-          return;
-        }
-        resolve(response.text || "");
+    safeSendMessage(tabId, {
+      type: "SUMMARY_DONE",
+      structured: parsed,
+      timing: {
+        ttftMs,
+        totalMs,
+        model: settings.model
       }
-    );
-  });
-}
-
-async function summarizePdf(tabId, payload) {
-  const title = payload.title || "";
-  const url = payload.url || "";
-
-  try {
-    await ensureOffscreenDocument();
-    const text = await extractPdfTextViaOffscreen(payload.pdfBase64);
-
-    if (!text || text.trim().length < 20) {
-      safeSendMessage(tabId, {
-        type: "SUMMARY_ERROR",
-        message: "Could not extract readable text from this PDF. Try Summarize visual region instead."
-      });
-      return;
-    }
-
-    // 20k chars was too small — a 15-page paper runs ~30k+ chars, and the
-    // old cap silently cut the model off mid-document (around page 7) with
-    // no way for it to know content was missing. Raised the cap, and now
-    // explicitly tell the model when truncation still happens so it
-    // discloses that honestly instead of reporting high confidence on a
-    // partial document.
-    const MAX_PDF_CHARS = 45000;
-    let usableText = text;
-    if (text.length > MAX_PDF_CHARS) {
-      usableText =
-        text.slice(0, MAX_PDF_CHARS) +
-        `\n\n[EXTRACTION NOTE: This PDF's extracted text was ${text.length} characters; ` +
-        `only the first ${MAX_PDF_CHARS} are included above due to length limits. ` +
-        `Content after this point (including anything from later sections, conclusion, ` +
-        `or references) was NOT provided to you. Do not claim confidence about ` +
-        `unseen content — list "content beyond the truncation point was not provided" ` +
-        `under unreadableSections.]`;
-    }
-
-    await summarizeTextOnce(tabId, usableText, title, url, "pdf");
+    });
   } catch (error) {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
@@ -646,13 +622,11 @@ async function summarizePage(tabId, payload, senderTabUrl) {
   const url = payload.url || senderTabUrl || "";
   const domain = detectDomain(payload.domainHint || url);
 
-  // PDFs are now handled via the dedicated SUMMARIZE_PDF message (content.js
-  // fetches the raw bytes and routes there directly) before this function
-  // is ever called. This branch is a defensive fallback only.
   if (domain === "pdf" || isPdfLikePage(url)) {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
-      message: "This looks like a PDF. Reopen the panel and choose Summarize page again."
+      message:
+        "This looks like a PDF, but PDF text extraction is not yet bundled. Use visual region capture for now."
     });
     return;
   }
@@ -660,19 +634,13 @@ async function summarizePage(tabId, payload, senderTabUrl) {
   if (!text || text.trim().length < 20) {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
-      message: "Could not find readable text on this page. Try Summarize visual region for image-based content."
+      message:
+        "Could not find readable text on this page. Try Summarize visual region for image-based content."
     });
     return;
   }
 
-  try {
-    await summarizeTextOnce(tabId, text, title, url, domain);
-  } catch (error) {
-    safeSendMessage(tabId, {
-      type: "SUMMARY_ERROR",
-      message: friendlyErrorMessage(error)
-    });
-  }
+  await summarizeTextOnce(tabId, text, title, url, domain);
 }
 
 async function captureRegion(sender, payload) {
@@ -681,7 +649,10 @@ async function captureRegion(sender, payload) {
   if (!tabId || windowId === undefined) return;
 
   try {
-    const screenshotDataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+    const screenshotDataUrl = await chrome.tabs.captureVisibleTab(windowId, {
+      format: "png"
+    });
+
     safeSendMessage(tabId, {
       type: "REGION_SCREENSHOT",
       screenshotDataUrl,
@@ -690,7 +661,8 @@ async function captureRegion(sender, payload) {
   } catch {
     safeSendMessage(tabId, {
       type: "SUMMARY_ERROR",
-      message: "Could not capture the selected region. Ensure the page is active, then try again."
+      message:
+        "Could not capture the selected region. Ensure the page is active, then try again."
     });
   }
 }
@@ -708,13 +680,17 @@ async function summarizeImage(tabId, payload) {
 
   const settings = await getModelSettings();
   const prompt = buildImagePrompt(title, url);
-  let raw = "";
 
   safeSendMessage(tabId, { type: "SUMMARY_START" });
 
-  const onChunk = (_, fullText) => {
+  let raw = "";
+
+  const onChunk = (fullText) => {
     raw = fullText;
-    safeSendMessage(tabId, { type: "SUMMARY_STREAM", fullText });
+    safeSendMessage(tabId, {
+      type: "SUMMARY_STREAM",
+      fullText
+    });
   };
 
   try {
@@ -746,15 +722,10 @@ async function summarizeImage(tabId, payload) {
 
     const parsed = normalizeSummary(parseJsonFromText(raw));
     const capped = capVisual(parsed);
-    safeSendMessage(tabId, { type: "SUMMARY_DONE", structured: capped });
 
-    await saveFollowupContext(tabId, {
-      title,
-      url,
-      domain: "visual_region",
-      sourceText:
-        "[This capture was a screenshot region, not extracted text. Follow-up answers can only draw on the structured summary below, not on the original image.]",
-      structuredSummary: capped
+    safeSendMessage(tabId, {
+      type: "SUMMARY_DONE",
+      structured: capped
     });
   } catch (error) {
     safeSendMessage(tabId, {
@@ -775,13 +746,5 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
   if (message.type === "SUMMARIZE_IMAGE" && sender.tab?.id) {
     summarizeImage(sender.tab.id, message.payload);
-  }
-
-  if (message.type === "SUMMARIZE_PDF" && sender.tab?.id) {
-    summarizePdf(sender.tab.id, message.payload);
-  }
-
-  if (message.type === "ASK_FOLLOWUP" && sender.tab?.id) {
-    askFollowup(sender.tab.id, message.payload);
   }
 });
